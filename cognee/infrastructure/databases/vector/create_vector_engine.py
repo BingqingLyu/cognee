@@ -313,6 +313,20 @@ def _create_vector_engine(
             embedding_engine=embedding_engine,
         )
 
+    elif vector_db_provider.lower() == "neug":
+        from .neug.NeuGVectorAdapter import NeuGVectorAdapter
+
+        return NeuGVectorAdapter(
+            url=vector_db_url,
+            api_key=vector_db_key,
+            embedding_engine=embedding_engine,
+            database_name=vector_db_name,
+            vector_db_host=vector_db_host,
+            vector_db_port=vector_db_port,
+            vector_db_username=vector_db_username,
+            vector_db_password=vector_db_password,
+        )
+
     elif vector_db_provider.lower() == "turso":
         try:
             # Probe the driver itself: the adapter module imports it lazily, so
