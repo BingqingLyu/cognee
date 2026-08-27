@@ -496,6 +496,21 @@ def _create_graph_engine(
             username=graph_database_username,
             password=graph_database_password,
         )
+
+    elif graph_database_provider == "neug":
+        # Embedded NeuG (Kuzu dialect): the database path is resolved centrally
+        # by the shared NeuG connection manager (NEUG_DB_PATH env var, or the
+        # cognee data root), not from the connection parameters.
+        from .neug.adapter import NeuGGraphAdapter
+
+        return NeuGGraphAdapter(
+            graph_database_url=graph_database_url,
+            graph_database_username=graph_database_username,
+            graph_database_password=graph_database_password,
+            graph_database_port=graph_database_port,
+            graph_database_key=graph_database_key,
+            database_name=graph_database_name,
+        )
     elif graph_database_provider == "neptune":
         try:
             from langchain_aws import NeptuneAnalyticsGraph
