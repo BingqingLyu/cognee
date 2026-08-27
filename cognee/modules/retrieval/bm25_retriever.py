@@ -22,6 +22,7 @@ class BM25ChunksRetriever(LexicalRetriever):
         stop_words: Optional[list[str]] = None,
         k1: float = 1.5,
         b: float = 0.75,
+        session_id: Optional[str] = None,
     ):
         """
         Parameters
@@ -51,7 +52,11 @@ class BM25ChunksRetriever(LexicalRetriever):
         self._stats_built = False
 
         super().__init__(
-            tokenizer=self._tokenizer, scorer=self._scorer, top_k=top_k, with_scores=with_scores
+            tokenizer=self._tokenizer,
+            scorer=self._scorer,
+            top_k=top_k,
+            with_scores=with_scores,
+            session_id=session_id,
         )
 
     def _tokenizer(self, text: str) -> list[str]:

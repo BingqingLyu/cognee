@@ -23,6 +23,7 @@ from cognee.modules.retrieval.graph_completion_decomposition_retriever import (
 from cognee.modules.retrieval.temporal_retriever import TemporalRetriever
 from cognee.modules.retrieval.coding_rules_retriever import CodingRulesRetriever
 from cognee.modules.retrieval.bm25_retriever import BM25ChunksRetriever
+from cognee.modules.retrieval.neug_fts_retriever import NeuGFTSChunksRetriever
 from cognee.modules.retrieval.graph_summary_completion_retriever import (
     GraphSummaryCompletionRetriever,
 )
@@ -49,6 +50,25 @@ def _hybrid_lane_top_k(config: dict, key: str, search_top_k: int | None) -> int 
     if search_top_k is None:
         return None
     return min(search_top_k, DEFAULT_HYBRID_LANE_TOP_K)
+
+
+def _chunks_lexical_retriever(top_k: int, session_id=None):
+    """Pick the CHUNKS_LEXICAL retriever based on the active vector backend.
+
+    When the vector store is NeuG, the chunk text already carries a native FTS
+    (bm25) index, so lexical ranking runs inside the database via
+    ``NeuGFTSChunksRetriever``. Every other backend keeps the default in-memory
+    ``BM25ChunksRetriever`` — zero behavior change for existing deployments.
+
+    ``session_id`` is forwarded so the session turn-preparation scopes to the
+    caller's session instead of the shared default one.
+    """
+    from cognee.infrastructure.databases.vector.config import get_vectordb_context_config
+
+    provider = (get_vectordb_context_config().get("vector_db_provider") or "").lower()
+    if provider == "neug":
+        return NeuGFTSChunksRetriever, {"top_k": top_k, "session_id": session_id}
+    return BM25ChunksRetriever, {"top_k": top_k, "session_id": session_id}
 
 
 async def get_search_type_retriever_instance(
@@ -331,7 +351,7 @@ async def get_search_type_retriever_instance(
                 "include_references": include_references,
             },
         ),
-        SearchType.CHUNKS_LEXICAL: (BM25ChunksRetriever, {"top_k": top_k}),
+        SearchType.CHUNKS_LEXICAL: _chunks_lexical_retriever(top_k, session_id),
         SearchType.GRAPH_REPORT: (GraphReportRetriever, {"top_n": top_k}),
         SearchType.CODING_RULES: (
             CodingRulesRetriever,

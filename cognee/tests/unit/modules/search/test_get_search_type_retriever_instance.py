@@ -364,11 +364,34 @@ async def test_chunks_lexical_returns_bm25_retriever():
     import cognee.modules.search.methods.get_search_type_retriever_instance as mod
     from cognee.modules.retrieval.bm25_retriever import BM25ChunksRetriever
 
-    retriever_instance = await mod.get_search_type_retriever_instance(
-        SearchType.CHUNKS_LEXICAL, query_text="q", top_k=3
-    )
+    # The route depends on the active vector provider, so pin it explicitly
+    # instead of reading whatever .env happens to configure.
+    with patch(
+        "cognee.infrastructure.databases.vector.config.get_vectordb_context_config",
+        return_value={"vector_db_provider": "lancedb"},
+    ):
+        retriever_instance = await mod.get_search_type_retriever_instance(
+            SearchType.CHUNKS_LEXICAL, query_text="q", top_k=3
+        )
     assert isinstance(retriever_instance, BM25ChunksRetriever)
     assert retriever_instance.top_k == 3
+
+
+@pytest.mark.asyncio
+async def test_chunks_lexical_routes_to_neug_fts_on_neug_provider():
+    import cognee.modules.search.methods.get_search_type_retriever_instance as mod
+    from cognee.modules.retrieval.neug_fts_retriever import NeuGFTSChunksRetriever
+
+    with patch(
+        "cognee.infrastructure.databases.vector.config.get_vectordb_context_config",
+        return_value={"vector_db_provider": "neug"},
+    ):
+        retriever_instance = await mod.get_search_type_retriever_instance(
+            SearchType.CHUNKS_LEXICAL, query_text="q", top_k=3, session_id="s1"
+        )
+    assert isinstance(retriever_instance, NeuGFTSChunksRetriever)
+    assert retriever_instance.top_k == 3
+    assert retriever_instance.session_id == "s1"
 
 
 @pytest.mark.asyncio
