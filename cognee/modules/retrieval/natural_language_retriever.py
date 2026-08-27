@@ -11,6 +11,65 @@ from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInte
 
 logger = get_logger("NaturalLanguageRetriever")
 
+# Default node-schema block for the Cypher-generation prompt, used when the
+# backend cannot answer the schema-introspection query (or returns nothing).
+# It describes cognee's per-type labels, as stored on label-per-type backends.
+_DEFAULT_NODE_SCHEMAS = """\
+- EntityType
+Properties: description, ontology_valid, name, created_at, type, version, topological_rank, updated_at, metadata, id
+Purpose: Represents the categories or classifications for entities in the database.
+
+- Entity
+Properties: description, ontology_valid, name, created_at, type, version, topological_rank, updated_at, metadata, id
+Purpose: Represents individual entities that belong to a specific type or classification.
+
+- TextDocument
+Properties: raw_data_location, name, mime_type, external_metadata, created_at, type, version, topological_rank, updated_at, metadata, id
+Purpose: Represents documents containing text data, along with metadata about their storage and format.
+
+- DocumentChunk
+Properties: version, created_at, type, topological_rank, cut_type, text, metadata, chunk_index, chunk_size, updated_at, id
+Purpose: Represents segmented portions of larger documents, useful for processing or analysis at a more granular level.
+
+- TextSummary
+Properties: topological_rank, metadata, id, type, updated_at, created_at, text, version
+Purpose: Represents summarized content generated from larger text documents, retaining essential information and metadata."""
+
+
+def _format_node_schemas(node_schemas) -> str:
+    """Render introspection rows into the prompt's node-schema section.
+
+    Rows come back as ``(labels, property keys)`` pairs from the
+    ``RETURN DISTINCT labels(n), collect(DISTINCT prop)`` introspection
+    query; backends may also append free-form guidance rows, which are kept
+    verbatim. Falls back to the hardcoded per-type schema when the backend
+    returned nothing usable.
+    """
+    if not node_schemas:
+        return _DEFAULT_NODE_SCHEMAS
+    rendered = []
+    for row in node_schemas:
+        if not isinstance(row, (list, tuple)) or len(row) != 2:
+            rendered.append(str(row))
+            continue
+        labels, properties = row
+        label_text = (
+            ", ".join(str(label) for label in labels)
+            if isinstance(labels, (list, tuple))
+            else str(labels)
+        )
+        if isinstance(properties, (list, tuple)) and len(properties) == 1:
+            # Single-entry rows carry free-form guidance (single-table backends).
+            rendered.append(f"- {label_text}\n{properties[0]}")
+        else:
+            props_text = (
+                ", ".join(str(prop) for prop in properties)
+                if isinstance(properties, (list, tuple))
+                else str(properties)
+            )
+            rendered.append(f"- {label_text}\nProperties: {props_text}")
+    return "\n\n".join(rendered) if rendered else _DEFAULT_NODE_SCHEMAS
+
 
 def _is_internal_schema_row(row: Any) -> bool:
     """True for a node-schema row that describes internal nodes.
@@ -101,11 +160,14 @@ class NaturalLanguageRetriever(BaseRetriever):
         node_schemas = [row for row in node_schemas or [] if not _is_internal_schema_row(row)]
         return node_schemas, edge_schemas
 
-    async def _generate_cypher_query(self, query: str, edge_schemas, previous_attempts=None) -> str:
+    async def _generate_cypher_query(
+        self, query: str, node_schemas, edge_schemas, previous_attempts=None
+    ) -> str:
         """Generate a Cypher query using LLM based on natural language query and schema information."""
         system_prompt = render_prompt(
             self.system_prompt_path,
             context={
+                "node_schemas": _format_node_schemas(node_schemas),
                 "edge_schemas": edge_schemas,
                 "previous_attempts": previous_attempts or "No attempts yet",
             },
@@ -127,7 +189,7 @@ class NaturalLanguageRetriever(BaseRetriever):
             logger.info(f"Starting attempt {attempt + 1}/{self.max_attempts} for query generation")
             try:
                 cypher_query = await self._generate_cypher_query(
-                    query, edge_schemas, previous_attempts
+                    query, node_schemas, edge_schemas, previous_attempts
                 )
 
                 logger.info(
@@ -202,8 +264,15 @@ class NaturalLanguageRetriever(BaseRetriever):
             - Optional[Any]: Returns the context retrieved from the graph database based on the
               query.
         """
-        # TODO: Do we want to process retrieved_objects into a context string?
-        return retrieved_objects
+        # Cypher rows are structured records, not prose; serialize them so the
+        # context stays a plain string end-to-end (SearchResultPayload only
+        # accepts str / list[str] contexts).
+        if retrieved_objects is None:
+            return None
+        try:
+            return json.dumps(retrieved_objects, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(retrieved_objects)
 
     async def get_completion_from_context(
         self, query: str, retrieved_objects: Any, context: Optional[Any] = None

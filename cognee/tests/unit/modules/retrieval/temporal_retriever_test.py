@@ -7,6 +7,7 @@ from datetime import datetime
 from cognee.modules.retrieval.temporal_retriever import TemporalRetriever
 from cognee.tasks.temporal_graph.models import QueryInterval, Timestamp
 from cognee.infrastructure.llm import LLMGateway
+from cognee.infrastructure.databases.graph.config import GraphConfig
 
 
 # Test TemporalRetriever initialization defaults and overrides
@@ -455,6 +456,14 @@ async def test_get_completion_with_provided_context():
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.CacheConfig"
         ) as mock_cache_config,
+        # The retrieval path below instantiates the real graph engine; pin the
+        # provider so deployments whose configured backend lacks the temporal
+        # collect_time_ids extension (only Ladybug/Neo4j implement it) still
+        # run this test hermetically.
+        patch(
+            "cognee.infrastructure.databases.graph.get_graph_engine.get_graph_context_config",
+            return_value=GraphConfig(graph_database_provider="ladybug").to_dict(),
+        ),
     ):
         mock_config = MagicMock()
         mock_config.caching = False
