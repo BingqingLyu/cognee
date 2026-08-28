@@ -18,8 +18,11 @@ Dialect decisions come from the cognee dialect probe
   ``TIMESTAMP($param)`` function form is rejected).
 - RETURN map literals are unsupported — all queries return flat columns and
   rows are assembled into dicts on the Python side.
-- ``type(r)``/``keys(n)``/``properties(n)`` do not exist; ``query()`` shims
-  them for Cypher pass-through (see ``_adapt_cypher``).
+- ``type(r)``/``keys(n)`` do not exist, and ``properties()`` only exists in
+  its documented two-argument path form ``PROPERTIES(nodes(path), 'col')``;
+  the single-argument form crashes the engine, so ``query()`` rewrites
+  ``type(x)`` and rejects single-argument ``properties()`` for Cypher
+  pass-through (see ``_adapt_cypher``).
 
 The adapter does not own the database connection: graph and vector adapters
 share one read-write NeuG database through the process-level
@@ -52,9 +55,47 @@ _WRITE_CHUNK_SIZE = 256
 # is the closest equivalent for LLM-generated Cypher.
 _TYPE_CALL_RE = re.compile(r"\btype\s*\(")
 
+# ``properties()`` only exists in the documented two-argument path form
+# ``PROPERTIES(nodes(path), 'col')``; the single-argument form crashes the
+# engine (SIGSEGV) instead of raising an error. LLM-generated Cypher often
+# writes ``properties(n)``, so reject it up front with an actionable message.
+_PROPERTIES_CALL_RE = re.compile(r"\bproperties\s*\(", re.IGNORECASE)
+
+
+def _reject_single_arg_properties(query: str) -> None:
+    """Raise for single-argument ``properties(x)`` calls outside literals.
+
+    Scans the query with string literals blanked out, finds each
+    ``properties(`` call, tracks parenthesis depth to its closing paren, and
+    rejects the call when its argument list has no top-level comma (the
+    two-argument form is supported and passes through).
+    """
+    masked = "".join(
+        " " * len(part) if index % 2 else part for index, part in enumerate(query.split("'"))
+    )
+    for match in _PROPERTIES_CALL_RE.finditer(masked):
+        depth = 1
+        has_top_level_comma = False
+        for char in masked[match.end() :]:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif char == "," and depth == 1:
+                has_top_level_comma = True
+        if not has_top_level_comma:
+            raise ValueError(
+                "NeuG does not support single-argument properties(): use "
+                "PROPERTIES(nodes(path), 'column'), or RETURN the node or its "
+                "columns explicitly instead."
+            )
+
 
 def _adapt_cypher_query(query: str) -> str:
-    """Rewrite ``type(x)`` calls to ``label(x)`` outside string literals.
+    """Reject single-argument ``properties()`` and rewrite ``type(x)`` calls
+    to ``label(x)`` outside string literals.
 
     ``type()`` does not exist in NeuG; ``label()`` returns the table name
     and is the closest equivalent for LLM-generated Cypher. Single-quoted
@@ -62,6 +103,7 @@ def _adapt_cypher_query(query: str) -> str:
     text (Cypher escapes quotes by doubling, which stays inside one
     segment pair).
     """
+    _reject_single_arg_properties(query)
     parts = query.split("'")
     for index in range(0, len(parts), 2):
         parts[index] = _TYPE_CALL_RE.sub("label(", parts[index])

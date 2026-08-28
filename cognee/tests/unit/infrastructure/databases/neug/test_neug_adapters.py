@@ -195,6 +195,26 @@ def test_adapt_cypher_keeps_string_literals():
     assert _adapt_cypher_query(query) == query
 
 
+def test_adapt_cypher_rejects_single_arg_properties():
+    """Single-argument properties() crashes the NeuG engine (SIGSEGV) instead
+    of raising an error, so the pass-through rejects it up front; the
+    documented two-argument path form stays allowed."""
+    from cognee.infrastructure.databases.graph.neug.adapter import _adapt_cypher_query
+
+    for query in (
+        "MATCH (n:Node) RETURN properties(n)",
+        "MATCH (a)-[p*1..2]->(c) RETURN PROPERTIES (nodes(p))",
+    ):
+        with pytest.raises(ValueError, match="single-argument properties"):
+            _adapt_cypher_query(query)
+    # the documented form passes through untouched
+    query = "MATCH (a)-[p*1..2]->(c) RETURN properties(nodes(p), 'name')"
+    assert _adapt_cypher_query(query) == query
+    # a 'properties(' inside a string literal must not trigger the guard
+    query = "MATCH (n) WHERE n.name = 'call properties(x) here' RETURN n"
+    assert _adapt_cypher_query(query) == query
+
+
 @pytest.mark.asyncio
 async def test_graph_add_node_string_form(neug_db):
     """The interface contract add_node(str, properties) must work (used e.g.
