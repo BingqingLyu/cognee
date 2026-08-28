@@ -306,6 +306,14 @@ async def test_vector_bm25_and_tag_filters(neug_db):
         fts = await v.full_text_search("DataPoint_text", "dogs bark", limit=3)
         assert fts[0][0]["text"] == "dogs bark at strangers"
 
+        # BUG-C1 regression: the search pipeline rewrites queries into
+        # interrogative form, so an OR-joined FTS query must still return
+        # partial matches when chunks lack the question words — and the
+        # chunk matching the most query terms ranks first.
+        interrogative = await v.full_text_search("DataPoint_text", "What is dogs bark?", limit=3)
+        assert interrogative, "interrogative query returned an empty result set"
+        assert interrogative[0][0]["text"] == "dogs bark at strangers"
+
         # P24: bm25 matches exact tokens (no stemming), and the OR tag filter
         # drops bm25 hits outside node_name. "dogs" matches two chunks but
         # "dogs bark at strangers" (set_b only) is filtered out by set_a.
@@ -422,11 +430,13 @@ async def test_collection_gets_hnsw_index(neug_db):
 
 
 def test_sanitize_fts_query_quotes_tokens():
-    """FTS5 reserved words (AND/OR/NOT) and specials must stay literals."""
+    """FTS5 reserved words (AND/OR/NOT) and specials must stay literals,
+    and tokens are OR-joined so partial matches rank via bm25 instead of
+    being excluded by the FTS5 default AND."""
     sanitize = NeuGVectorAdapter._sanitize_fts_query
-    assert sanitize("why is it not working?") == '"why" "is" "it" "not" "working"'
+    assert sanitize("why is it not working?") == '"why" OR "is" OR "it" OR "not" OR "working"'
     assert sanitize("or") == '"or"'
-    assert sanitize('say "hi"') == '"say" "hi"'
+    assert sanitize('say "hi"') == '"say" OR "hi"'
 
 
 def test_node_name_where_escapes_regex_metacharacters():

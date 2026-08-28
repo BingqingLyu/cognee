@@ -134,11 +134,21 @@ class NeuGVectorAdapter(VectorDBInterface):
         return await self.connection_manager.execute(query, params)
 
     async def _table_exists(self, table_name: str) -> bool:
+        """Verify a collection table is really there.
+
+        A missing-table failure (stale registry row, e.g. after an
+        out-of-band prune) is a legit "no" answer; any other failure is
+        surfaced. Note the engine logs an E-level "Schema mismatch" for
+        every probe against a missing table, so callers must keep probing
+        rare (see ``has_collection``).
+        """
         try:
             await self._execute(f"MATCH (v:{table_name}) RETURN v.id LIMIT 1")
-            return True
-        except Exception:
-            return False
+        except Exception as e:
+            if "does not exist" in str(e):
+                return False
+            raise
+        return True
 
     async def _ensure_registry(self) -> None:
         """Create the cross-process collection registry table if needed."""
@@ -224,8 +234,21 @@ class NeuGVectorAdapter(VectorDBInterface):
         if collection_name in self._collections:
             return True
         table_name = self._table_name(collection_name)
-        if not await self._table_exists(table_name):
-            return False
+        # Existence is answered from the collection registry: probing a
+        # missing table with MATCH makes the engine log an E-level
+        # "Schema mismatch: Table X does not exist" every time, which floods
+        # the cognify log while collections are created lazily.
+        registered = await self._list_registered_collections()
+        if (collection_name, table_name) not in registered:
+            if registered:
+                # The registry has entries, just not this one: it is absent.
+                return False
+            # No registry entries at all (fresh or pre-registry database):
+            # one probe is needed to adopt tables created by an older build
+            # that predates the registry. This runs at most until the first
+            # collection is registered, so cognify stays probe-free.
+            if not await self._table_exists(table_name):
+                return False
         # A table that predates the current DDL would silently truncate payload
         # blobs (``IF NOT EXISTS`` never upgrades schemas): verify capacity
         # and recreate it in place when stale, so every later write is safe.
@@ -495,10 +518,18 @@ class NeuGVectorAdapter(VectorDBInterface):
         with a runtime error and (2) parses AND/OR/NOT as operators, so
         "why is it not working" would negate the term ``working``. Both are
         avoided by stripping punctuation and wrapping every token in double
-        quotes: tokens stay literals and are AND-joined by FTS5 default.
+        quotes: tokens stay literals and cannot inject operators.
+
+        Tokens are OR-joined instead of relying on the FTS5 default AND:
+        the search pipeline rewrites queries into interrogative form
+        ("LoCoMo benchmark" -> "What is the LoCoMo benchmark?"), and AND
+        then returns zero rows whenever a chunk lacks any question word.
+        OR keeps bm25 partial-match semantics (hits are ranked by the sum
+        of matched-term weights, like the default backend's BM25 retriever),
+        so ranking quality is preserved.
         """
         cleaned = re.sub(r"[^\w\s]", " ", str(query_text), flags=re.UNICODE)
-        return " ".join('"' + token.replace('"', '""') + '"' for token in cleaned.split())
+        return " OR ".join('"' + token.replace('"', '""') + '"' for token in cleaned.split())
 
     async def search(
         self,
