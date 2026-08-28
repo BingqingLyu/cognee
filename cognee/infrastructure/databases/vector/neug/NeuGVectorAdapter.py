@@ -40,7 +40,7 @@ Dialect notes (from the cognee dialect probe):
 import asyncio
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -65,6 +65,14 @@ logger = get_logger("NeuGVectorAdapter")
 # below detects that instead of producing corrupt JSON on read.
 _CAPACITY_PROBE_ID = "__neug_capacity_probe__"
 _CAPACITY_PROBE_SIZE = 512
+
+# Collection registry: NeuG has no SHOW TABLES introspection, so collection
+# names are tracked in a fixed node table in the same database. This lets
+# ``prune()`` discover collections created by OTHER processes/adapters
+# instead of silently no-oping on a fresh adapter instance (whose in-memory
+# ``self._collections`` is empty).
+_REGISTRY_TABLE = "neug_vector_collections"
+_REGISTRY_TABLES = frozenset({"Node", "EDGE", _REGISTRY_TABLE})
 
 
 class IndexSchema(DataPoint):
@@ -129,6 +137,31 @@ class NeuGVectorAdapter(VectorDBInterface):
         except Exception:
             return False
 
+    async def _ensure_registry(self) -> None:
+        """Create the cross-process collection registry table if needed."""
+        await self._execute(
+            f"CREATE NODE TABLE IF NOT EXISTS {_REGISTRY_TABLE}("
+            "name STRING PRIMARY KEY, table_name STRING)"
+        )
+
+    async def _register_collection(self, collection_name: str, table_name: str) -> None:
+        await self._ensure_registry()
+        await self._execute(
+            f"MERGE (r:{_REGISTRY_TABLE} {{name: $name}}) "
+            "ON CREATE SET r.table_name = $table_name "
+            "ON MATCH SET r.table_name = $table_name",
+            {"name": collection_name, "table_name": table_name},
+        )
+
+    async def _list_registered_collections(self) -> List[Tuple[str, str]]:
+        try:
+            await self._ensure_registry()
+            rows = await self._execute(f"MATCH (r:{_REGISTRY_TABLE}) RETURN r.name, r.table_name")
+        except Exception as e:
+            logger.warning("Collection registry read failed: %s", e)
+            return []
+        return [(row[0], row[1]) for row in rows if row[0]]
+
     async def _verify_blob_capacity(self, table_name: str) -> None:
         """Fail fast when a pre-existing table truncates long VARCHAR blobs.
 
@@ -137,22 +170,33 @@ class NeuGVectorAdapter(VectorDBInterface):
         and writes truncate against an old schema, so lengths alone can lie)
         means the table predates the current DDL (``IF NOT EXISTS`` never
         upgrades schemas), so the collection is dropped and recreated below.
+        A rejected probe write (e.g. an embedding-dimension change) marks the
+        table stale just the same: either way the caller recreates it.
         """
         probe = "p" * _CAPACITY_PROBE_SIZE
+        rows: List[List[Any]] = []
         try:
-            await self._execute(
-                self._MERGE_TEMPLATE.format(table=table_name),
-                {
-                    "id": _CAPACITY_PROBE_ID,
-                    "vector": [0.0] * self.vector_size,
-                    "text": probe,
-                    "payload": probe,
-                    "belongs_to_set": "",
-                },
-            )
-            rows = await self._execute(
-                f"MATCH (v:{table_name}) WHERE v.id = '{_CAPACITY_PROBE_ID}' RETURN v.payload",
-            )
+            try:
+                await self._execute(
+                    self._MERGE_TEMPLATE.format(table=table_name),
+                    {
+                        "id": _CAPACITY_PROBE_ID,
+                        "vector": [0.0] * self.vector_size,
+                        "text": probe,
+                        "payload": probe,
+                        "belongs_to_set": "",
+                    },
+                )
+                rows = await self._execute(
+                    f"MATCH (v:{table_name}) WHERE v.id = '{_CAPACITY_PROBE_ID}' RETURN v.payload",
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"NeuG collection table '{table_name}' rejected the capacity "
+                    f"probe write ({e}). The table predates the current DDL "
+                    "(e.g. a different embedding dimension); it will be dropped "
+                    "and recreated."
+                ) from e
         finally:
             try:
                 await self._execute(
@@ -189,6 +233,9 @@ class NeuGVectorAdapter(VectorDBInterface):
             await self._execute(f"DROP TABLE {table_name}")
             await self._create_collection_table(table_name)
         self._collections[collection_name] = table_name
+        # Register pre-existing tables (created before the registry existed)
+        # so a cross-process ``prune()`` can still discover them.
+        await self._register_collection(collection_name, table_name)
         return True
 
     async def _create_collection_table(self, table_name: str) -> None:
@@ -226,6 +273,7 @@ class NeuGVectorAdapter(VectorDBInterface):
                 return
             table_name = self._table_name(collection_name)
             await self._create_collection_table(table_name)
+            await self._register_collection(collection_name, table_name)
             self._collections[collection_name] = table_name
             logger.debug("Created NeuG collection table %s", table_name)
 
@@ -244,6 +292,16 @@ class NeuGVectorAdapter(VectorDBInterface):
         # ``#`` delimiter: NeuG's CONTAINS treats ``|`` as regex alternation.
         return "".join(f"#{tag}#" for tag in (tags or []))
 
+    @staticmethod
+    def _validate_tag(tag) -> str:
+        # The tag delimiter must never occur inside a tag: ``"a#b"`` would
+        # serialize to ``#a#b#`` and match the wrong collection under
+        # CONTAINS filtering.
+        text = str(tag)
+        if "#" in text:
+            raise ValueError(f"Collection/set names must not contain '#': {text!r}")
+        return text
+
     async def _fetch_existing_tags(self, table_name: str, ids: List[str]) -> Dict[str, List[str]]:
         if not ids:
             return {}
@@ -259,8 +317,11 @@ class NeuGVectorAdapter(VectorDBInterface):
                 params,
             )
         except Exception as e:
-            logger.debug("belongs_to_set lookup failed for '%s': %s", table_name, e)
-            return {}
+            # A failed tag lookup is not an empty one: proceeding would
+            # overwrite the points' existing collection membership with only
+            # the incoming tags, silently dropping them from filtered search.
+            logger.error("belongs_to_set lookup failed for '%s': %s", table_name, e)
+            raise
         existing: Dict[str, List[str]] = {}
         for row in rows:
             tags = [tag for tag in (row[1] or "").split("#") if tag]
@@ -349,7 +410,7 @@ class NeuGVectorAdapter(VectorDBInterface):
                     )
                 payload = payload_schema.model_validate(point.get("payload")).model_dump()
                 text = str(payload.get("text") or "")
-                tags = payload.get("belongs_to_set") or []
+                tags = [self._validate_tag(tag) for tag in (payload.get("belongs_to_set") or [])]
                 await self._execute(
                     merge_query,
                     {
@@ -397,25 +458,31 @@ class NeuGVectorAdapter(VectorDBInterface):
         # NeuG requires the CONTAINS right operand to be a literal
         # (parameters are rejected with ERR_COMPILATION), so the tags are
         # inlined; doubling single quotes keeps them inside one literal.
+        # CONTAINS evaluates its right operand as a REGEX, so every regex
+        # metacharacter in the tag must be escaped (``test.v2`` would
+        # otherwise also match ``testXv2``; ``(``/``*`` would fail to
+        # compile the pattern altogether).
         joiner = " AND " if operator == "AND" else " OR "
         clauses = []
         for name in node_name:
-            literal = "#" + str(name).replace("'", "''") + "#"
+            escaped = re.escape(self._validate_tag(name))
+            literal = "#" + escaped.replace("'", "''") + "#"
             clauses.append(f"v.belongs_to_set CONTAINS '{literal}'")
         return "(" + joiner.join(clauses) + ")"
 
     @staticmethod
     def _sanitize_fts_query(query_text: str) -> str:
-        """Strip FTS5 syntax characters from a bm25 query (P26).
+        """Turn a natural-language query into a safe FTS5 phrase (P26).
 
         NeuG's FTS extension hands the query string to SQLite FTS5, which
-        rejects unquoted specials (``?``, ``"``, ``*``, parentheses, ...) with
-        a runtime error instead of treating them as literals. Natural-language
-        queries ("What did they talk about?") therefore crash bm25 lookups
-        unless punctuation is stripped first; tokens are AND-joined by default.
+        (1) rejects unquoted specials (``?``, ``"``, ``*``, parentheses, ...)
+        with a runtime error and (2) parses AND/OR/NOT as operators, so
+        "why is it not working" would negate the term ``working``. Both are
+        avoided by stripping punctuation and wrapping every token in double
+        quotes: tokens stay literals and are AND-joined by FTS5 default.
         """
         cleaned = re.sub(r"[^\w\s]", " ", str(query_text), flags=re.UNICODE)
-        return " ".join(cleaned.split())
+        return " ".join('"' + token.replace('"', '""') + '"' for token in cleaned.split())
 
     async def search(
         self,
@@ -577,17 +644,41 @@ class NeuGVectorAdapter(VectorDBInterface):
             await self._execute(f"DROP TABLE {table_name}")
         except Exception as e:
             logger.debug("Drop table %s skipped: %s", table_name, e)
+        try:
+            await self._ensure_registry()
+            await self._execute(
+                f"MATCH (r:{_REGISTRY_TABLE}) WHERE r.name = $name DELETE r",
+                {"name": collection_name},
+            )
+        except Exception as e:
+            logger.debug("Registry cleanup for %s skipped: %s", collection_name, e)
 
     async def prune(self):
-        """Drop every collection table this adapter knows about.
+        """Drop every vector collection table, discovered cross-process.
 
-        The graph tables (Node/EDGE) live in the same NeuG database and are
-        untouched; cognee clears those through the graph adapter's
-        ``delete_graph``.
+        Collections are enumerated from the shared registry table (not from
+        this instance's in-memory cache), so a ``cognee prune`` running in a
+        fresh process against a persistent database still clears everything
+        earlier runs stored. The graph tables (Node/EDGE) live in the same
+        NeuG database and are untouched; cognee clears those through the
+        graph adapter's ``delete_graph``.
         """
+        candidates = dict(await self._list_registered_collections())
         for collection_name in list(self._collections.keys()):
-            await self.delete_collection(collection_name)
+            candidates.setdefault(collection_name, self._collections[collection_name])
+        for collection_name, table_name in candidates.items():
+            if table_name in _REGISTRY_TABLES:
+                continue
+            try:
+                await self._execute(f"DROP TABLE {table_name}")
+                logger.debug("Pruned NeuG collection table %s", table_name)
+            except Exception as e:
+                logger.debug("Prune drop of %s skipped: %s", table_name, e)
         self._collections.clear()
+        try:
+            await self._execute(f"MATCH (r:{_REGISTRY_TABLE}) DETACH DELETE r")
+        except Exception as e:
+            logger.debug("Registry cleanup during prune skipped: %s", e)
 
     # ------------------------------------------------------------------
     # Embeddings / indexing

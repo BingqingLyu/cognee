@@ -11,6 +11,18 @@ from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInte
 
 logger = get_logger("NaturalLanguageRetriever")
 
+
+class GuidanceSchemaRow(str):
+    """Sentinel for free-form schema guidance rows in introspection results.
+
+    Single-table backends append guidance text (e.g. how to express cognee
+    semantic types on their fixed schema) alongside the real schema rows.
+    A dedicated type keeps guidance distinguishable from a real label that
+    happens to carry a single property key, which a length-based heuristic
+    cannot tell apart.
+    """
+
+
 # Default node-schema block for the Cypher-generation prompt, used when the
 # backend cannot answer the schema-introspection query (or returns nothing).
 # It describes cognee's per-type labels, as stored on label-per-type backends.
@@ -36,19 +48,49 @@ Properties: topological_rank, metadata, id, type, updated_at, created_at, text, 
 Purpose: Represents summarized content generated from larger text documents, retaining essential information and metadata."""
 
 
+def _schema_row_from_dict(row: dict):
+    """Extract ``(labels, properties)`` from a dict-shaped introspection row.
+
+    The Neo4j Cypher path returns ``result.data()`` rows as dicts keyed by
+    the RETURN aliases (``NodeLabels``/``Properties``); without this, those
+    rows fall through to ``str(row)`` and the prompt ends up with Python
+    dict reprs instead of a readable schema.
+    """
+    labels = None
+    properties = None
+    for key, value in row.items():
+        if key.lower() in ("nodelabels", "labels", "label") and labels is None:
+            labels = value
+        elif key.lower() in ("properties", "props", "propertykeys") and properties is None:
+            properties = value
+    if labels is None:
+        list_values = [value for value in row.values() if isinstance(value, (list, tuple))]
+        if len(list_values) >= 2:
+            labels, properties = list_values[0], list_values[1]
+        elif len(list_values) == 1:
+            labels = list_values[0]
+    return labels, properties
+
+
 def _format_node_schemas(node_schemas) -> str:
     """Render introspection rows into the prompt's node-schema section.
 
     Rows come back as ``(labels, property keys)`` pairs from the
     ``RETURN DISTINCT labels(n), collect(DISTINCT prop)`` introspection
-    query; backends may also append free-form guidance rows, which are kept
-    verbatim. Falls back to the hardcoded per-type schema when the backend
-    returned nothing usable.
+    query, as dicts on backends whose Cypher pass-through returns
+    ``result.data()`` rows (Neo4j), or as ``GuidanceSchemaRow`` sentinels
+    for free-form guidance. Falls back to the hardcoded per-type schema
+    when the backend returned nothing usable.
     """
     if not node_schemas:
         return _DEFAULT_NODE_SCHEMAS
     rendered = []
     for row in node_schemas:
+        if isinstance(row, GuidanceSchemaRow):
+            rendered.append(f"- {row}")
+            continue
+        if isinstance(row, dict):
+            row = _schema_row_from_dict(row)
         if not isinstance(row, (list, tuple)) or len(row) != 2:
             rendered.append(str(row))
             continue
@@ -58,16 +100,12 @@ def _format_node_schemas(node_schemas) -> str:
             if isinstance(labels, (list, tuple))
             else str(labels)
         )
-        if isinstance(properties, (list, tuple)) and len(properties) == 1:
-            # Single-entry rows carry free-form guidance (single-table backends).
-            rendered.append(f"- {label_text}\n{properties[0]}")
-        else:
-            props_text = (
-                ", ".join(str(prop) for prop in properties)
-                if isinstance(properties, (list, tuple))
-                else str(properties)
-            )
-            rendered.append(f"- {label_text}\nProperties: {props_text}")
+        props_text = (
+            ", ".join(str(prop) for prop in properties)
+            if isinstance(properties, (list, tuple))
+            else str(properties)
+        )
+        rendered.append(f"- {label_text}\nProperties: {props_text}")
     return "\n\n".join(rendered) if rendered else _DEFAULT_NODE_SCHEMAS
 
 
@@ -266,8 +304,10 @@ class NaturalLanguageRetriever(BaseRetriever):
         """
         # Cypher rows are structured records, not prose; serialize them so the
         # context stays a plain string end-to-end (SearchResultPayload only
-        # accepts str / list[str] contexts).
-        if retrieved_objects is None:
+        # accepts str / list[str] contexts). Keep empty results falsy so
+        # SearchResultPayload treats them the same as the other lexical
+        # retrievers instead of surfacing a literal "[]" as the answer.
+        if not retrieved_objects:
             return None
         try:
             return json.dumps(retrieved_objects, default=str, ensure_ascii=False)

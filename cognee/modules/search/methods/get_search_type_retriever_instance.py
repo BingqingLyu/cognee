@@ -37,6 +37,9 @@ from cognee.modules.retrieval.agentic_retriever import AgenticRetriever
 from cognee.modules.retrieval.code_retriever import CodeRetriever
 from cognee.modules.retrieval.graph_report_retriever import GraphReportRetriever
 from cognee.context_global_variables import session_user
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger("GetSearchTypeRetrieverInstance")
 
 
 def _hybrid_lane_top_k(config: dict, key: str, search_top_k: int | None) -> int | None:
@@ -62,10 +65,25 @@ def _chunks_lexical_retriever(top_k: int, session_id=None):
 
     ``session_id`` is forwarded so the session turn-preparation scopes to the
     caller's session instead of the shared default one.
+
+    A config that fails to build (invalid VECTOR_POOL_ARGS, missing port,
+    ...) falls back to ``BM25ChunksRetriever``: lexical retrieval does not
+    need the vector backend, and this keeps unrelated search types working
+    when only the vector config is broken. The config is read lazily — only
+    when CHUNKS_LEXICAL is actually requested — so building the registry for
+    other search types never touches the vector configuration.
     """
     from cognee.infrastructure.databases.vector.config import get_vectordb_context_config
 
-    provider = (get_vectordb_context_config().get("vector_db_provider") or "").lower()
+    provider = ""
+    try:
+        provider = (get_vectordb_context_config().get("vector_db_provider") or "").lower()
+    except Exception as e:
+        logger.warning(
+            "Vector config unavailable while picking the CHUNKS_LEXICAL "
+            "retriever (%s); falling back to BM25ChunksRetriever.",
+            e,
+        )
     if provider == "neug":
         return NeuGFTSChunksRetriever, {"top_k": top_k, "session_id": session_id}
     return BM25ChunksRetriever, {"top_k": top_k, "session_id": session_id}
@@ -351,7 +369,10 @@ async def get_search_type_retriever_instance(
                 "include_references": include_references,
             },
         ),
-        SearchType.CHUNKS_LEXICAL: _chunks_lexical_retriever(top_k, session_id),
+        # Resolved lazily below: the picker reads the vector configuration,
+        # and evaluating it here would make EVERY search type depend on the
+        # vector config at registry-build time.
+        SearchType.CHUNKS_LEXICAL: None,
         SearchType.GRAPH_REPORT: (GraphReportRetriever, {"top_n": top_k}),
         SearchType.CODING_RULES: (
             CodingRulesRetriever,
@@ -430,6 +451,8 @@ async def get_search_type_retriever_instance(
         retriever_instance = retriever(**kwargs)
     else:
         retriever_info = search_core_registry.get(query_type)
+        if retriever_info is None and query_type is SearchType.CHUNKS_LEXICAL:
+            retriever_info = _chunks_lexical_retriever(top_k, session_id)
         # Check if retriever info is found for the given query type
         if not retriever_info:
             raise UnsupportedSearchTypeError(str(query_type))

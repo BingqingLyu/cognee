@@ -119,6 +119,11 @@ async def test_graph_crud_and_traversal(neug_db):
         nodes, edges = await g.get_neighborhood(["n1"], depth=2)
         assert sorted(i for i, _ in nodes) == ["n1", "n2", "n3"]
 
+        # depth=0 means no expansion: just the seed nodes themselves.
+        nodes, edges = await g.get_neighborhood(["n1"], depth=0)
+        assert [i for i, _ in nodes] == ["n1"]
+        assert edges == []
+
         nodes, _ = await g.get_filtered_graph_data([{"type": ["Person"]}])
         assert sorted(i for i, _ in nodes) == ["n1", "n2"]
 
@@ -154,6 +159,52 @@ async def test_graph_raw_cypher_and_introspection_shim(neug_db):
         # single-table schema instead of erroring out.
         fallback = await g.query("MATCH (e:Person) RETURN e.name ORDER BY e.name")
         assert fallback == ["Alice", "Bob"]
+
+        # Bare-colon relationship patterns ([:Label]) fall back too: the rel
+        # label rewrites to EDGE and the node label to Node across rounds.
+        bare = await g.query("MATCH ()-[:knows]->(m:Person) RETURN m.name")
+        assert bare == ["Bob"]
+
+        # type() inside a string literal must stay untouched; a rewrite would
+        # break the query instead of returning zero rows.
+        literal_rows = await g.query("MATCH (n:Node) WHERE n.name = 'my type (test)' RETURN n.name")
+        assert literal_rows == []
+    finally:
+        await g.close()
+
+
+def test_rewrite_missing_label_supports_bare_colon_rel_pattern():
+    rewrite = NeuGGraphAdapter._rewrite_missing_label
+    bound = rewrite(
+        "MATCH (a)-[r:Entity]->(b)",
+        "Schema mismatch: Table Entity does not exist (bindRelTableEntries)",
+    )
+    assert bound == "MATCH (a)-[r:EDGE]->(b)"
+    bare = rewrite(
+        "MATCH (a)-[:Entity]->(b)",
+        "bindRelTableEntries: Table Entity does not exist",
+    )
+    assert bare == "MATCH (a)-[:EDGE]->(b)"
+
+
+def test_adapt_cypher_keeps_string_literals():
+    from cognee.infrastructure.databases.graph.neug.adapter import _adapt_cypher_query
+
+    assert _adapt_cypher_query("RETURN type(n)") == "RETURN label(n)"
+    query = "MATCH (n) WHERE n.name = 'my type (test)' RETURN n"
+    assert _adapt_cypher_query(query) == query
+
+
+@pytest.mark.asyncio
+async def test_graph_add_node_string_form(neug_db):
+    """The interface contract add_node(str, properties) must work (used e.g.
+    by add_model_class_to_graph)."""
+    g = NeuGGraphAdapter()
+    try:
+        await g.add_node("model_cls", {"name": "ModelClass", "type": "DataPoint"})
+        node = await g.get_node("model_cls")
+        assert node["name"] == "ModelClass"
+        assert node["type"] == "DataPoint"
     finally:
         await g.close()
 
@@ -329,6 +380,22 @@ async def test_vector_payload_survives_database_reopen(neug_db):
         await v2.close()
 
 
+def test_sanitize_fts_query_quotes_tokens():
+    """FTS5 reserved words (AND/OR/NOT) and specials must stay literals."""
+    sanitize = NeuGVectorAdapter._sanitize_fts_query
+    assert sanitize("why is it not working?") == '"why" "is" "it" "not" "working"'
+    assert sanitize("or") == '"or"'
+    assert sanitize('say "hi"') == '"say" "hi"'
+
+
+def test_node_name_where_escapes_regex_metacharacters():
+    # NeuG CONTAINS parses the literal as a regex: '.' must not match any char.
+    where = NeuGVectorAdapter._node_name_where(NeuGVectorAdapter, ["set.a"], "OR")
+    assert where == "(v.belongs_to_set CONTAINS '#set\\.a#')"
+    with pytest.raises(ValueError):
+        NeuGVectorAdapter._node_name_where(NeuGVectorAdapter, ["a#b"], "OR")
+
+
 @pytest.mark.asyncio
 async def test_vector_stale_table_is_recreated(neug_db):
     """A collection table left behind by an older (short VARCHAR) DDL must be
@@ -357,6 +424,46 @@ async def test_vector_stale_table_is_recreated(neug_db):
         await v.close()
 
 
+@pytest.mark.asyncio
+async def test_vector_prune_discovers_cross_instance_collections(neug_db):
+    """prune() in a FRESH adapter instance must still drop collections that
+    an earlier instance persisted (registry-based discovery, not the empty
+    in-memory cache)."""
+    v = NeuGVectorAdapter(embedding_engine=_FakeEmbeddingEngine())
+    await v.create_data_points("DataPoint_text", [_chunk("prune discovery probe")])
+    await v.close()
+
+    v2 = NeuGVectorAdapter(embedding_engine=_FakeEmbeddingEngine())
+    g = NeuGGraphAdapter()
+    try:
+        await g.add_nodes([_Node("n1", "Alice", "Person")])
+        assert v2._collections == {}
+        await v2.prune()
+        assert await v2.has_collection("DataPoint_text") is False
+        # The graph tables in the same database are untouched.
+        assert (await g.get_node("n1"))["name"] == "Alice"
+    finally:
+        await v2.close()
+        await g.close()
+
+
+def test_connection_manager_survives_new_event_loop(neug_db):
+    """The process-level singleton outlives individual event loops: each
+    asyncio.run() gets a fresh loop, so the statement lock must be rebound
+    instead of raising 'bound to a different event loop'."""
+    import asyncio
+
+    async def _is_empty():
+        adapter = NeuGGraphAdapter()
+        try:
+            return await adapter.is_empty()
+        finally:
+            await adapter.close()
+
+    assert asyncio.run(_is_empty()) is True
+    assert asyncio.run(_is_empty()) is True
+
+
 # ---------------------------------------------------------------------------
 # Shared database: graph + vector adapters coexist on one NeuG DB
 # ---------------------------------------------------------------------------
@@ -380,7 +487,8 @@ async def test_shared_database_coexistence(neug_db):
         still = await v.full_text_search("DataPoint_text", "cat", limit=5)
         assert still, "vector search broke after graph adapter close"
 
-        # Vector prune drops collection tables but must not touch Node/EDGE.
+        # Vector prune drops collection tables (registry-based) but must not
+        # touch Node/EDGE.
         await v.prune()
         assert await v.has_collection("DataPoint_text") is False
     finally:

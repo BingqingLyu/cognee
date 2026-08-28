@@ -600,6 +600,7 @@ def _create_graph_engine(
         "neptune",
         "neptune_analytics",
         "turso",
+        "neug",
     ]
     raise EnvironmentError(
         f"Unsupported graph database provider: {graph_database_provider}. "

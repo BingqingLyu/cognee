@@ -59,8 +59,12 @@ class NeuGConnectionManager:
         self._lifecycle_lock = threading.Lock()
         # Serializes every statement; a single rw connection cannot run two
         # statements concurrently anyway, and this keeps the gather() write
-        # paths from interleaving mid-batch.
+        # paths from interleaving mid-batch. The manager is a process-level
+        # singleton but asyncio locks bind to the loop that first acquires
+        # them, so the lock is recreated whenever the running loop changes
+        # (scripts that asyncio.run() repeatedly, one loop per pytest test).
         self._statement_lock = asyncio.Lock()
+        self._statement_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         # Single worker so the native blocking calls also stay ordered at the
         # thread level, not only at the asyncio level.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neug-exec")
@@ -78,7 +82,13 @@ class NeuGConnectionManager:
             logger.debug("NeuG connection acquired (refcount=%d)", self._refcount)
 
     def release(self) -> None:
-        """Unregister an adapter user; close the database at refcount zero."""
+        """Unregister an adapter user; close the database at refcount zero.
+
+        A statement already running on the executor thread is safe here by
+        construction: ``_execute_sync`` re-reads ``self._conn`` at run time,
+        so a close racing a queued statement turns that statement into a
+        clean RuntimeError instead of a use-after-close at the native layer.
+        """
         with self._lifecycle_lock:
             self._refcount = max(0, self._refcount - 1)
             logger.debug("NeuG connection released (refcount=%d)", self._refcount)
@@ -131,6 +141,20 @@ class NeuGConnectionManager:
     # Execution
     # ------------------------------------------------------------------
 
+    def _get_statement_lock(self) -> asyncio.Lock:
+        """Return the statement lock bound to the currently running loop.
+
+        A process-level singleton outlives any single event loop; reusing a
+        lock that was first acquired on a different loop raises
+        ``RuntimeError: ... is bound to a different event loop``, so the
+        lock is recreated on loop change.
+        """
+        loop = asyncio.get_running_loop()
+        if self._statement_lock_loop is not loop:
+            self._statement_lock = asyncio.Lock()
+            self._statement_lock_loop = loop
+        return self._statement_lock
+
     def _execute_sync(
         self, query: str, params: Optional[Dict[str, Any]], access_mode: str
     ) -> List[List[Any]]:
@@ -165,7 +189,7 @@ class NeuGConnectionManager:
         access_mode: str = "",
     ) -> List[List[Any]]:
         """Execute one statement, serialized with every other statement."""
-        async with self._statement_lock:
+        async with self._get_statement_lock():
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 self._executor, self._execute_sync, query, params, access_mode
@@ -178,7 +202,7 @@ class NeuGConnectionManager:
         access_mode: str = "",
     ) -> tuple[List[List[Any]], List[str]]:
         """Like ``execute`` but also returns the result column names."""
-        async with self._statement_lock:
+        async with self._get_statement_lock():
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 self._executor, self._execute_sync_with_columns, query, params, access_mode

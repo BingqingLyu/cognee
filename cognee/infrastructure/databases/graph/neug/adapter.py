@@ -38,6 +38,7 @@ from cognee.exceptions import CogneeValidationError
 from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInterface
 from cognee.infrastructure.databases.neug import get_neug_connection_manager
 from cognee.infrastructure.engine import DataPoint
+from cognee.modules.retrieval.natural_language_retriever import GuidanceSchemaRow
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.shared.logging_utils import get_logger
 
@@ -50,6 +51,22 @@ _WRITE_CHUNK_SIZE = 256
 # ``type(x)`` does not exist in NeuG; ``label(x)`` returns the table name and
 # is the closest equivalent for LLM-generated Cypher.
 _TYPE_CALL_RE = re.compile(r"\btype\s*\(")
+
+
+def _adapt_cypher_query(query: str) -> str:
+    """Rewrite ``type(x)`` calls to ``label(x)`` outside string literals.
+
+    ``type()`` does not exist in NeuG; ``label()`` returns the table name
+    and is the closest equivalent for LLM-generated Cypher. Single-quoted
+    segments are skipped so literals like ``'my type (test)'`` keep their
+    text (Cypher escapes quotes by doubling, which stays inside one
+    segment pair).
+    """
+    parts = query.split("'")
+    for index in range(0, len(parts), 2):
+        parts[index] = _TYPE_CALL_RE.sub("label(", parts[index])
+    return "'".join(parts)
+
 
 # NeuG reports unknown Cypher labels as ``Schema mismatch: Table X does not
 # exist``. LLM-generated Cypher (NATURAL_LANGUAGE search) assumes cognee's
@@ -171,7 +188,7 @@ class NeuGGraphAdapter(GraphDBInterface):
     # ------------------------------------------------------------------
 
     def _adapt_cypher(self, query: str) -> str:
-        return _TYPE_CALL_RE.sub("label(", query)
+        return _adapt_cypher_query(query)
 
     @staticmethod
     def _rewrite_missing_label(query: str, error: str) -> Optional[str]:
@@ -191,7 +208,13 @@ class NeuGGraphAdapter(GraphDBInterface):
         if missing in ("Node", "EDGE"):
             return None
         if "bindRelTableEntries" in error or "relationship pattern label" in error:
-            rewritten = re.sub(rf"\[(\w+:)?{re.escape(missing)}\b", r"[\1EDGE", query)
+            # Relationship-pattern labels: with a bound variable ([r:Label])
+            # or bare ([:Label]); the optional group keeps either prefix.
+            rewritten = re.sub(
+                rf"\[(\w+:|:)?{re.escape(missing)}\b",
+                lambda m: "[" + (m.group(1) or "") + "EDGE",
+                query,
+            )
         else:
             rewritten = re.sub(rf":{re.escape(missing)}\b", ":Node", query)
         return rewritten if rewritten != query else None
@@ -260,31 +283,31 @@ class NeuGGraphAdapter(GraphDBInterface):
             # collect(DISTINCT prop) AS Properties`` would produce it.
             return [
                 [["Node"], ["id", "name", "type", "created_at", "updated_at", "properties"]],
-                [
-                    ["Node"],
-                    [
-                        "single-table schema: the only node label is Node; cognee "
-                        "semantic types (Entity, EntityType, DocumentChunk, "
-                        "TextSummary, ...) are VALUES of the n.type column, never "
-                        "node names; node names are ALL LOWERCASE; kind nodes "
-                        "like 'person'/'organization' are EDGE TARGETS: instances "
-                        "point TO them, so filter the target, e.g. "
-                        "MATCH (e:Node)-[:EDGE]->(t:Node) WHERE t.name = 'person' "
-                        "RETURN e.name (WRONG, returns nothing: "
-                        "WHERE p.name = 'person' ... RETURN t.name)"
-                    ],
-                ],
+                # Sentinel row: ``_format_node_schemas`` renders it as
+                # free-form guidance (a length-based heuristic cannot tell
+                # guidance apart from a real single-property label).
+                GuidanceSchemaRow(
+                    "single-table schema: the only node label is Node; cognee "
+                    "semantic types (Entity, EntityType, DocumentChunk, "
+                    "TextSummary, ...) are VALUES of the n.type column, never "
+                    "node names; node names are ALL LOWERCASE; kind nodes "
+                    "like 'person'/'organization' are EDGE TARGETS: instances "
+                    "point TO them, so filter the target, e.g. "
+                    "MATCH (e:Node)-[:EDGE]->(t:Node) WHERE t.name = 'person' "
+                    "RETURN e.name (WRONG, returns nothing: "
+                    "WHERE p.name = 'person' ... RETURN t.name)"
+                ),
             ]
         # Edge schema: rendered verbatim into the natural-language prompt's
         # ``Edge schema`` section, so return readable single-table guidance
         # (every relationship lives in one EDGE table whose
         # ``relationship_name`` column carries the semantic type).
         return [
-            [
+            GuidanceSchemaRow(
                 "single EDGE relationship table: MATCH (a:Node)-[r:EDGE]->(b:Node); "
                 "the semantic relationship type is the r.relationship_name column "
                 "(e.g. 'mentioned_in', 'is_type_of'), not the edge label"
-            ]
+            )
         ]
 
     async def query(self, query: str, params: Optional[dict] = None) -> List[Any]:
@@ -356,8 +379,16 @@ class NeuGGraphAdapter(GraphDBInterface):
         )
         return bool(rows and rows[0][0])
 
-    def _node_merge_params(self, node: DataPoint) -> dict:
-        properties = node.model_dump() if hasattr(node, "model_dump") else vars(node)
+    def _node_merge_params(
+        self, node: Union[DataPoint, str], properties: Optional[dict] = None
+    ) -> dict:
+        if isinstance(node, str):
+            # Interface contract: a string node id with an explicit property
+            # dict (``add_node("id", {...})``), used e.g. by
+            # ``add_model_class_to_graph``.
+            properties = {"id": node, **(properties or {})}
+        else:
+            properties = node.model_dump() if hasattr(node, "model_dump") else vars(node)
         core = {
             "id": str(properties.get("id", "")),
             "name": str(properties.get("name", "")),
@@ -390,9 +421,11 @@ class NeuGGraphAdapter(GraphDBInterface):
             n.updated_at = $updated_at
     """
 
-    async def add_node(self, node: DataPoint) -> None:
+    async def add_node(
+        self, node: Union[DataPoint, str], properties: Optional[dict] = None
+    ) -> None:
         try:
-            await self._execute(self._NODE_MERGE_QUERY, self._node_merge_params(node))
+            await self._execute(self._NODE_MERGE_QUERY, self._node_merge_params(node, properties))
         except Exception as e:
             logger.error(f"Failed to add node: {e}")
             raise
@@ -557,6 +590,16 @@ class NeuGGraphAdapter(GraphDBInterface):
             logger.error(f"Failed to check edges in batch: {e}")
             raise
 
+    @staticmethod
+    def _is_missing_table_error(error: Exception) -> bool:
+        """True when the failure is just 'the table does not exist yet'.
+
+        A missing-table error on a read genuinely means 'no rows' (empty or
+        never-written graph); anything else is a real query failure that
+        must not be disguised as an empty result.
+        """
+        return "does not exist" in str(error)
+
     async def get_edges(self, node_id: str) -> List[Tuple[Dict[str, Any], str, Dict[str, Any]]]:
         try:
             rows = await self._execute(
@@ -573,8 +616,10 @@ class NeuGGraphAdapter(GraphDBInterface):
                 (self._node_dict(*row[0:4]), row[4], self._node_dict(*row[5:9])) for row in rows
             ]
         except Exception as e:
+            if self._is_missing_table_error(e):
+                return []
             logger.error(f"Failed to get edges for node {node_id}: {e}")
-            return []
+            raise
 
     async def get_neighbors(self, node_id: str) -> List[Dict[str, Any]]:
         try:
@@ -588,8 +633,10 @@ class NeuGGraphAdapter(GraphDBInterface):
             )
             return [self._node_dict(*row) for row in rows]
         except Exception as e:
+            if self._is_missing_table_error(e):
+                return []
             logger.error(f"Failed to get neighbours for node {node_id}: {e}")
-            return []
+            raise
 
     async def get_predecessors(
         self, node_id: Union[str, UUID], edge_label: Optional[str] = None
@@ -610,8 +657,10 @@ class NeuGGraphAdapter(GraphDBInterface):
             )
             return [self._node_dict(*row) for row in rows]
         except Exception as e:
+            if self._is_missing_table_error(e):
+                return []
             logger.error(f"Failed to get predecessors for node {node_id}: {e}")
-            return []
+            raise
 
     async def get_successors(
         self, node_id: Union[str, UUID], edge_label: Optional[str] = None
@@ -632,8 +681,10 @@ class NeuGGraphAdapter(GraphDBInterface):
             )
             return [self._node_dict(*row) for row in rows]
         except Exception as e:
+            if self._is_missing_table_error(e):
+                return []
             logger.error(f"Failed to get successors for node {node_id}: {e}")
-            return []
+            raise
 
     async def get_connections(
         self, node_id: str
@@ -658,8 +709,10 @@ class NeuGGraphAdapter(GraphDBInterface):
                 connections.append((source, relationship, target))
             return connections
         except Exception as e:
+            if self._is_missing_table_error(e):
+                return []
             logger.error(f"Failed to get connections for node {node_id}: {e}")
-            return []
+            raise
 
     # ------------------------------------------------------------------
     # Graph-wide operations
@@ -732,7 +785,10 @@ class NeuGGraphAdapter(GraphDBInterface):
         all_ids = {str(node_id) for node_id in node_ids}
         frontier = list(all_ids)
         try:
-            for _ in range(max(1, int(depth))):
+            # depth <= 0 means no expansion: the result is the seed nodes
+            # themselves (with any edges among them), matching the other
+            # backends' hop semantics.
+            for _ in range(max(0, int(depth))):
                 if not frontier:
                     break
                 params: dict = {}

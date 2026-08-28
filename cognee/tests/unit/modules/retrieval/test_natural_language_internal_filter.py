@@ -5,8 +5,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from cognee.modules.retrieval.natural_language_retriever import (
+    GuidanceSchemaRow,
     NaturalLanguageRetriever,
     _contains_internal_node,
+    _format_node_schemas,
     _is_internal_schema_row,
 )
 
@@ -89,3 +91,40 @@ async def test_get_graph_schema_drops_internal_node_rows():
 
     assert node_schemas == [{"NodeLabels": ["Node"], "Properties": ["name", "text"]}]
     assert edge_schemas == edge_schema
+
+
+class TestFormatNodeSchemas:
+    def test_renders_neo4j_dict_rows(self):
+        """Dict rows (Neo4j result.data()) must render as a readable schema,
+        not as Python dict reprs in the prompt."""
+        rendered = _format_node_schemas([{"NodeLabels": ["Entity"], "Properties": ["name", "id"]}])
+        assert rendered == "- Entity\nProperties: name, id"
+
+    def test_renders_tuple_rows_and_guidance_sentinel(self):
+        rendered = _format_node_schemas(
+            [
+                (["Node"], ["id", "name"]),
+                GuidanceSchemaRow("single-table guidance text"),
+            ]
+        )
+        assert "- Node\nProperties: id, name" in rendered
+        assert "single-table guidance text" in rendered
+
+    def test_single_property_label_keeps_properties_structure(self):
+        """A real label with one property key must not be mistaken for
+        free-form guidance (the old length heuristic did exactly that)."""
+        rendered = _format_node_schemas([(["TextSummary"], ["id"])])
+        assert rendered == "- TextSummary\nProperties: id"
+
+    def test_falls_back_to_defaults_when_empty(self):
+        assert _format_node_schemas([]) == _format_node_schemas(None)
+
+
+@pytest.mark.asyncio
+async def test_context_from_empty_objects_is_falsy():
+    """Empty Cypher results must not surface as the truthy string "[]"."""
+    retriever = NaturalLanguageRetriever()
+    assert await retriever.get_context_from_objects("q", []) is None
+    assert await retriever.get_context_from_objects("q", None) is None
+    context = await retriever.get_context_from_objects("q", [{"a": 1}])
+    assert context == '[{"a": 1}]'
