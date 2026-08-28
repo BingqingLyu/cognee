@@ -1106,12 +1106,15 @@ class NeuGGraphAdapter(GraphDBInterface):
             }
 
     async def get_disconnected_nodes(self) -> List[str]:
-        """Node ids with no incident edges (NOT EXISTS subqueries are not
-        available in NeuG, so this is computed from the edge list)."""
-        node_rows = await self._execute("MATCH (n:Node) RETURN n.id")
-        edge_rows = await self._execute("MATCH (n:Node)-[r:EDGE]-() RETURN DISTINCT n.id")
-        connected = {row[0] for row in edge_rows}
-        return [str(row[0]) for row in node_rows if row[0] not in connected]
+        """Node ids with no incident edges.
+
+        NeuG's dialect has no ``NOT EXISTS(...)`` subquery form, but the
+        documented anti-join pattern ``WHERE NOT (n)-[:EDGE]-()`` works and
+        pushes the filtering into the engine instead of diffing two full
+        scans in Python.
+        """
+        rows = await self._execute("MATCH (n:Node) WHERE NOT (n)-[:EDGE]-() RETURN n.id")
+        return [str(row[0]) for row in rows]
 
     async def get_model_independent_graph_data(self) -> Dict[str, List[str]]:
         node_labels = await self._execute("MATCH (n:Node) RETURN DISTINCT labels(n)")

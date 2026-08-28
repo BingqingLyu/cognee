@@ -362,8 +362,8 @@ async def test_vector_payload_survives_database_reopen(neug_db):
 
     Regression guard for the NeuG 0.2.0 HNSW/checkpoint bug (dialect probe
     P30): a broken close-time checkpoint makes the WAL replay truncate every
-    VARCHAR to 255 characters. The adapter creates no HNSW index, so closing
-    and reopening the database must leave long payloads intact.
+    VARCHAR to 255 characters. Closing and reopening the database must leave
+    long payloads intact (verified fixed in current builds).
     """
     long_text = "survives the checkpoint cycle " * 40  # > 1000 chars
     point = _chunk(long_text, ["set_a"])
@@ -378,6 +378,27 @@ async def test_vector_payload_survives_database_reopen(neug_db):
         assert retrieved[0].payload["text"] == long_text
     finally:
         await v2.close()
+
+
+@pytest.mark.asyncio
+async def test_collection_gets_hnsw_index(neug_db):
+    """Each collection gets a cosine HNSW index next to the FTS index. The
+    close-time corruption of the old 0.2.0 build (P30) is fixed in current
+    builds (see .neug_work/repro_upstream/repro4). SHOW INDEXES is not part
+    of the dialect, so index presence is asserted by attempting the same
+    CREATE INDEX the adapter would run."""
+    v = NeuGVectorAdapter(embedding_engine=_FakeEmbeddingEngine())
+    try:
+        await v.create_data_points("DataPoint_text", [_chunk("indexed text", ["set_a"])])
+        table = await v.get_collection("DataPoint_text")
+        # re-creating the adapter's own index must say "already exists"
+        with pytest.raises(RuntimeError, match="already exists"):
+            await v.connection_manager.execute(
+                f"CREATE INDEX {table}_hnsw_idx "
+                f"ON {table} USING HNSW (vector) WITH (metric = 'cosine')"
+            )
+    finally:
+        await v.close()
 
 
 def test_sanitize_fts_query_quotes_tokens():

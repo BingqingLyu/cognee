@@ -9,12 +9,15 @@ graph adapter uses (shared through ``NeuGConnectionManager``):
 with an FTS index on ``text``. ``text`` holds the same string that gets
 embedded, so native bm25 lexical search is available without any extra store.
 
-No HNSW index is created on ``vector``: in NeuG 0.2.0 any HNSW index breaks
-the checkpoint-on-close (``filesystem error: in rename`` against the index's
-runtime file), and the WAL replay after such a failed checkpoint truncates
-every VARCHAR value to 255 characters. ANN therefore runs as an exact scan
-(``ORDER BY vector_distance_cosine(...) ASC``), which is fine at cognee's
-collection sizes; see the dialect probe conclusions (P30).
+A cosine HNSW index is created on ``vector`` next to the FTS index (the old
+v0.2.0 HNSW checkpoint corruption — probe P30 — is fixed in current builds;
+the only later data-loss incident occurred when reopening a database written
+by an unreleased internal build, so shipped versions are unaffected; see the
+repro in .neug_work/repro_upstream). Note the NeuG-specific clause order:
+``CREATE INDEX <name> IF NOT EXISTS ON ...`` (the SQL-style ``CREATE INDEX
+IF NOT EXISTS <name> ON ...`` is a parser error). On any index failure ANN
+degrades to an exact scan (``ORDER BY vector_distance_cosine(...) ASC``),
+so a failed index must not fail collection creation.
 
 Dialect notes (from the cognee dialect probe):
 - ``ORDER BY vector_distance_cosine(v.vector, $q) ASC`` for ANN;
@@ -250,9 +253,22 @@ class NeuGVectorAdapter(VectorDBInterface):
             )
             """
         )
-        # FTS index only: an HNSW index on ``vector`` would break the
-        # checkpoint-on-close and corrupt VARCHAR data on the next open (P30),
-        # so ANN runs as an exact scan instead.
+        # Cosine HNSW index for ANN (probe P30 verified the checkpoint bug
+        # is fixed in current builds). ``IF NOT EXISTS`` keeps the call
+        # idempotent across processes (NeuG clause order: name first). On
+        # any failure ANN degrades to an exact scan, so a failed index must
+        # not fail collection creation.
+        try:
+            await self._execute(
+                f"CREATE INDEX {table_name}_hnsw_idx IF NOT EXISTS "
+                f"ON {table_name} USING HNSW (vector) WITH (metric = 'cosine')"
+            )
+        except Exception as e:
+            logger.warning(
+                "HNSW index skipped for %s (ANN falls back to exact scan): %s",
+                table_name,
+                e,
+            )
         try:
             await self._execute(
                 f"CREATE INDEX {table_name}_fts_idx ON {table_name} USING FTS (text)"
