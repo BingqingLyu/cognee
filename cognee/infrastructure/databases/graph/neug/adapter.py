@@ -1331,19 +1331,29 @@ class NeuGGraphAdapter(GraphDBInterface):
         if limit < 0:
             raise ValueError(f"Limit must be non-negative, got {limit}")
 
-        query = """
+        # NeuG pagination is broken three ways (0.2.0 baseline and ecd1b5a
+        # alike): bound parameters in SKIP/LIMIT are silently ignored; a
+        # literal SKIP combined with LIMIT is silently dropped; and a SKIP
+        # past the last row crashes with ERR_INTERNAL_ERROR 1012. Only
+        # ``ORDER BY ... LIMIT`` behaves, so the window is fetched as the
+        # ordered prefix of length offset+limit and sliced client-side.
+        # The caller (get_triplet_datapoints) walks offsets sequentially
+        # over a static graph, so the repeated prefix reads are cheap at
+        # benchmark scale; correctness of the partition comes first.
+        query = f"""
         MATCH (start_node:Node)-[relationship:EDGE]->(end_node:Node)
         RETURN start_node.id, start_node.name, start_node.type, start_node.properties,
                relationship.relationship_name, relationship.properties,
                end_node.id, end_node.name, end_node.type, end_node.properties
         ORDER BY start_node.id, end_node.id, relationship.relationship_name
-        SKIP $offset LIMIT $limit
+        LIMIT {int(offset) + int(limit)}
         """
         try:
-            rows = await self._execute(query, {"offset": offset, "limit": limit})
+            rows = await self._execute(query)
         except Exception as e:
             logger.error(f"Failed to execute triplet query: {str(e)}")
             raise
+        rows = rows[int(offset) :]
 
         triplets = []
         for row in rows:

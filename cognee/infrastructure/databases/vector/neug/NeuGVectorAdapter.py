@@ -28,7 +28,9 @@ Dialect notes (from the cognee dialect probe):
   the delimiter is ``#`` because NeuG's CONTAINS treats ``|`` as a regex
   alternation metacharacter (literals containing ``|`` match everything);
 - ``CONTAINS`` requires a literal right operand (parameters are rejected),
-  so tags are inlined with single quotes doubled;
+  so tags are inlined; the literal parser only accepts ``\'`` / ``\\``
+  escape sequences (``''`` doubling and ``\.`` both fail to parse), so
+  every regex backslash is doubled when inlined;
 - ANN combined with ``LIMIT $param`` segfaults: ANN queries inline a literal
   LIMIT (bm25 tolerates parameterized LIMIT);
 - a WHERE clause in the same statement as a distance/bm25 ranking expression
@@ -651,16 +653,20 @@ class NeuGVectorAdapter(VectorDBInterface):
     def _node_name_where(self, node_name: List[str], operator: str) -> str:
         # NeuG requires the CONTAINS right operand to be a literal
         # (parameters are rejected with ERR_COMPILATION), so the tags are
-        # inlined; doubling single quotes keeps them inside one literal.
-        # CONTAINS evaluates its right operand as a REGEX, so every regex
-        # metacharacter in the tag must be escaped (``test.v2`` would
-        # otherwise also match ``testXv2``; ``(``/``*`` would fail to
-        # compile the pattern altogether).
+        # inlined. CONTAINS evaluates its right operand as a REGEX, so
+        # every regex metacharacter in the tag must be escaped (``test.v2``
+        # would otherwise also match ``testXv2``; ``(``/``*`` would fail to
+        # compile the pattern altogether). re.escape supplies those
+        # backslashes, but the Cypher string literal parser only accepts
+        # ``\'`` and ``\\`` escape sequences (``\.`` is a parse error), so
+        # each regex backslash is doubled for the literal; single quotes
+        # use ``\'`` (``''`` doubling is a parse error in NeuG).
         joiner = " AND " if operator == "AND" else " OR "
         clauses = []
         for name in node_name:
             escaped = re.escape(self._validate_tag(name))
-            literal = "#" + escaped.replace("'", "''") + "#"
+            normalized = escaped.replace("\\'", "'")
+            literal = "#" + normalized.replace("\\", "\\\\").replace("'", "\\'") + "#"
             clauses.append(f"v.belongs_to_set CONTAINS '{literal}'")
         return "(" + joiner.join(clauses) + ")"
 

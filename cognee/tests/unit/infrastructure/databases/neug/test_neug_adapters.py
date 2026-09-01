@@ -449,8 +449,13 @@ def test_sanitize_fts_query_quotes_tokens():
 
 def test_node_name_where_escapes_regex_metacharacters():
     # NeuG CONTAINS parses the literal as a regex: '.' must not match any char.
+    # The regex backslash is doubled because the Cypher literal parser only
+    # accepts ``\'`` / ``\\`` escape sequences (``\.`` fails to parse).
     where = NeuGVectorAdapter._node_name_where(NeuGVectorAdapter, ["set.a"], "OR")
-    assert where == "(v.belongs_to_set CONTAINS '#set\\.a#')"
+    assert where == "(v.belongs_to_set CONTAINS '#set\\\\.a#')"
+    # Single quotes use ``\'`` (SQL-style ``''`` doubling is a parse error).
+    where = NeuGVectorAdapter._node_name_where(NeuGVectorAdapter, ["o'brien"], "OR")
+    assert where == "(v.belongs_to_set CONTAINS '#o\\'brien#')"
     with pytest.raises(ValueError):
         NeuGVectorAdapter._node_name_where(NeuGVectorAdapter, ["a#b"], "OR")
 
