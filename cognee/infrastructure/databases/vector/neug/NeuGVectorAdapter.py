@@ -50,6 +50,10 @@ from pydantic import BaseModel
 
 from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
 from cognee.infrastructure.databases.neug import get_neug_connection_manager
+from cognee.infrastructure.databases.neug.copy_batch import (
+    COPY_BUFFER_FLUSH_ROWS,
+    copy_jsonl_rows,
+)
 from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.databases.vector.pgvector.serialize_data import serialize_data
@@ -117,6 +121,13 @@ class NeuGVectorAdapter(VectorDBInterface):
         # collection_name -> NeuG node table name
         self._collections: Dict[str, str] = {}
         self.VECTOR_DB_LOCK = asyncio.Lock()
+        # Deferred COPY buffer: table_name -> point id -> entry; each entry
+        # carries the full table row plus whether a MERGE fallback must union
+        # the incoming tags with the stored ones (the ``create_data_points``
+        # contract) instead of replacing them. Rows are merged into one COPY
+        # statement per table at flush time (see ``flush_pending_writes``).
+        self._pending_rows: Dict[str, Dict[str, dict]] = {}
+        self._flushing = False
 
     # ------------------------------------------------------------------
     # Helpers
@@ -131,6 +142,16 @@ class NeuGVectorAdapter(VectorDBInterface):
         return sanitized
 
     async def _execute(self, query: str, params: Optional[dict] = None) -> List[List[Any]]:
+        await self.flush_pending_writes()
+        return await self.connection_manager.execute(query, params)
+
+    async def _execute_raw(self, query: str, params: Optional[dict] = None) -> List[List[Any]]:
+        """Run a statement without flushing the COPY buffer first.
+
+        Only for use by ``flush_pending_writes`` and its helpers; everything
+        else goes through ``_execute`` so buffered writes are visible to
+        every search, delete and MERGE upsert.
+        """
         return await self.connection_manager.execute(query, params)
 
     async def _table_exists(self, table_name: str) -> bool:
@@ -249,15 +270,18 @@ class NeuGVectorAdapter(VectorDBInterface):
             # collection is registered, so cognify stays probe-free.
             if not await self._table_exists(table_name):
                 return False
-        # A table that predates the current DDL would silently truncate payload
-        # blobs (``IF NOT EXISTS`` never upgrades schemas): verify capacity
-        # and recreate it in place when stale, so every later write is safe.
-        try:
-            await self._verify_blob_capacity(table_name)
-        except ValueError as e:
-            logger.warning("Recreating stale NeuG collection table: %s", e)
-            await self._execute(f"DROP TABLE {table_name}")
-            await self._create_collection_table(table_name)
+            # A table that predates the current DDL would silently truncate
+            # payload blobs (``IF NOT EXISTS`` never upgrades schemas): verify
+            # capacity and recreate it in place when stale. Registered tables
+            # were created by the current DDL, so they skip the probe - its
+            # insert/delete cycle would also poke an indexed table, which the
+            # upstream capacity bug makes risky near a row-count boundary.
+            try:
+                await self._verify_blob_capacity(table_name)
+            except ValueError as e:
+                logger.warning("Recreating stale NeuG collection table: %s", e)
+                await self._execute(f"DROP TABLE {table_name}")
+                await self._create_collection_table(table_name)
         self._collections[collection_name] = table_name
         # Register pre-existing tables (created before the registry existed)
         # so a cross-process ``prune()`` can still discover them.
@@ -276,11 +300,26 @@ class NeuGVectorAdapter(VectorDBInterface):
             )
             """
         )
-        # Cosine HNSW index for ANN (probe P30 verified the checkpoint bug
-        # is fixed in current builds). ``IF NOT EXISTS`` keeps the call
-        # idempotent across processes (NeuG clause order: name first). On
-        # any failure ANN degrades to an exact scan, so a failed index must
-        # not fail collection creation.
+        # NOTE: HNSW/FTS indexes are intentionally NOT created here. An
+        # upstream NeuG bug makes MERGE upserts (ON MATCH updates or reused
+        # delete holes) crash with "Index out of range at column.h set_any"
+        # once an INDEXED table's row count crosses an internal capacity
+        # boundary (first at 4096 rows, then every ~1024 rows after).
+        # Unindexed tables tolerate the same upsert pattern indefinitely
+        # (verified past 9000 rows), so the ingest path stays index-free and
+        # the indexes are bulk-built lazily on first search, when the table
+        # is already populated. Remove this deferral (build indexes here
+        # again) once the upstream fix lands; see .neug_work/NEUG_BUG_REPORT_4096.md.
+
+    async def _ensure_search_indexes(self, table_name: str) -> None:
+        """Lazily bulk-build HNSW + FTS indexes on a populated table.
+
+        Building on existing rows is a bulk path and is safe; only the
+        incremental index-maintenance path during upsert-heavy growth hits
+        the upstream capacity bug (see ``_create_collection_table``). ANN
+        degrades to an exact scan and bm25 is unavailable until both
+        succeed, so index failures must never fail the search itself.
+        """
         try:
             await self._execute(
                 f"CREATE INDEX {table_name}_hnsw_idx IF NOT EXISTS "
@@ -294,10 +333,9 @@ class NeuGVectorAdapter(VectorDBInterface):
             )
         try:
             await self._execute(
-                f"CREATE INDEX {table_name}_fts_idx ON {table_name} USING FTS (text)"
+                f"CREATE INDEX {table_name}_fts_idx IF NOT EXISTS ON {table_name} USING FTS (text)"
             )
         except Exception as e:
-            # Index already exists (table pre-dated this process).
             logger.debug("Index creation skipped for %s: %s", table_name, e)
 
     async def create_collection(
@@ -341,16 +379,26 @@ class NeuGVectorAdapter(VectorDBInterface):
             raise ValueError(f"Collection/set names must not contain '#': {text!r}")
         return text
 
-    async def _fetch_existing_tags(self, table_name: str, ids: List[str]) -> Dict[str, List[str]]:
+    async def _fetch_existing_tags(
+        self, table_name: str, ids: List[str]
+    ) -> Tuple[Dict[str, List[str]], set]:
+        """Return (tags_by_id, existing_ids) for the given point ids.
+
+        ``existing_ids`` contains every id already present in the table,
+        including rows whose ``belongs_to_set`` is empty (which the tags
+        dict omits); COPY silently skips existing primary keys, so the
+        upsert path needs the full membership to route those rows through
+        MERGE instead.
+        """
         if not ids:
-            return {}
+            return {}, set()
         params: dict = {}
         clauses = []
         for i, point_id in enumerate(ids):
             params[f"id_{i}"] = str(point_id)
             clauses.append(f"v.id = $id_{i}")
         try:
-            rows = await self._execute(
+            rows = await self._execute_raw(
                 f"MATCH (v:{table_name}) WHERE {' OR '.join(clauses)} "
                 "RETURN v.id, v.belongs_to_set",
                 params,
@@ -362,11 +410,13 @@ class NeuGVectorAdapter(VectorDBInterface):
             logger.error("belongs_to_set lookup failed for '%s': %s", table_name, e)
             raise
         existing: Dict[str, List[str]] = {}
+        found_ids: set = set()
         for row in rows:
+            found_ids.add(row[0])
             tags = [tag for tag in (row[1] or "").split("#") if tag]
             if tags:
                 existing[row[0]] = tags
-        return existing
+        return existing, found_ids
 
     _MERGE_TEMPLATE = """
         MERGE (v:{table} {{id: $id}})
@@ -381,6 +431,94 @@ class NeuGVectorAdapter(VectorDBInterface):
             v.payload = $payload,
             v.belongs_to_set = $belongs_to_set
     """
+
+    async def _merge_rows(self, table_name: str, rows: List[dict]) -> None:
+        """Per-row MERGE for rows COPY cannot handle (already-existing ids)."""
+        merge_query = self._MERGE_TEMPLATE.format(table=table_name)
+        for row in rows:
+            await self._execute_raw(merge_query, row)
+
+    async def _bulk_upsert_rows(self, table_name: str, rows: List[dict]) -> None:
+        """Split rows into new vs existing and bulk-load the new ones.
+
+        COPY silently skips existing primary keys (first write wins), which
+        would silently drop updates; the caller must have routed rows whose
+        ids already exist through MERGE. On any COPY failure the rows fall
+        back to per-row MERGE so correctness never depends on the fast path.
+        """
+        if not rows:
+            return
+        try:
+            await copy_jsonl_rows(lambda q: self._execute_raw(q), table_name, rows)
+        except Exception as e:
+            logger.warning(
+                "COPY bulk load into %s failed, falling back to MERGE: %s", table_name, e
+            )
+            await self._merge_rows(table_name, rows)
+
+    # ------------------------------------------------------------------
+    # Deferred COPY buffer
+    # ------------------------------------------------------------------
+
+    async def _maybe_flush_pending(self) -> None:
+        pending_count = sum(len(entries) for entries in self._pending_rows.values())
+        if pending_count >= COPY_BUFFER_FLUSH_ROWS:
+            await self.flush_pending_writes()
+
+    async def flush_pending_writes(self) -> None:
+        """Write all buffered rows to the database as one COPY per table.
+
+        Every statement issued through ``_execute`` flushes first, so
+        searches, deletes and MERGE upserts always see the buffered rows;
+        this method is the only place the buffer is drained. The
+        new-vs-existing split (and the tag union for existing points) is
+        decided here at flush time, not when rows were buffered, so it
+        always reflects the current table state.
+        """
+        if self._flushing or not self._pending_rows:
+            return
+        self._flushing = True
+        pending, self._pending_rows = self._pending_rows, {}
+        try:
+            for table_name, entries in pending.items():
+                await self._flush_table_entries(table_name, entries)
+        finally:
+            self._flushing = False
+
+    async def _flush_table_entries(self, table_name: str, entries: Dict[str, dict]) -> None:
+        existing_tags, existing_ids = await self._fetch_existing_tags(table_name, list(entries))
+        merge_rows = []
+        new_rows = []
+        for point_id, entry in entries.items():
+            row = entry["row"]
+            if point_id in existing_ids:
+                if entry["union_tags"]:
+                    row = self._with_unioned_tags(row, existing_tags.get(point_id) or [])
+                merge_rows.append(row)
+            else:
+                new_rows.append(row)
+        if merge_rows:
+            merge_query = self._MERGE_TEMPLATE.format(table=table_name)
+            for row in merge_rows:
+                await self._execute_raw(merge_query, row)
+        await self._bulk_upsert_rows(table_name, new_rows)
+
+    def _with_unioned_tags(self, row: dict, prior_tags: List[str]) -> dict:
+        """Copy of ``row`` whose tags are unioned with the stored ones.
+
+        The ``create_data_points`` contract keeps every collection the point
+        ever belonged to: prior (database) tags first, then the incoming
+        ones, mirrored into both the payload blob and the filter column.
+        """
+        incoming = [tag for tag in (row.get("belongs_to_set") or "").split("#") if tag]
+        merged = list(dict.fromkeys(list(prior_tags) + incoming))
+        payload = json.loads(row["payload"])
+        payload["belongs_to_set"] = merged
+        return {
+            **row,
+            "payload": json.dumps(payload, cls=JSONEncoder),
+            "belongs_to_set": self._belongs_to_set_string(merged),
+        }
 
     async def create_data_points(self, collection_name: str, data_points: List[DataPoint]):
         if not data_points:
@@ -397,28 +535,36 @@ class NeuGVectorAdapter(VectorDBInterface):
         vectors = await self.embed_data(texts)
 
         async with self.VECTOR_DB_LOCK:
-            existing_tags = await self._fetch_existing_tags(
-                table_name, [str(dp.id) for dp in data_points]
-            )
-            merge_query = self._MERGE_TEMPLATE.format(table=table_name)
+            # Buffer the rows for the deferred COPY flush; the flush decides
+            # new-vs-existing per point and unions stored tags there (the
+            # create_data_points contract). When the same id is re-buffered
+            # before a flush, tags accumulate locally instead of being
+            # overwritten — matching the tag union the flush applies against
+            # tags already stored in the table.
+            pending_table = self._pending_rows.setdefault(table_name, {})
             for data_point, text, vector in zip(data_points, texts, vectors):
                 payload = serialize_data(data_point.model_dump())
-                incoming_tags = payload.get("belongs_to_set") or []
-                prior_tags = existing_tags.get(str(data_point.id)) or []
-                merged_tags = list(dict.fromkeys(list(prior_tags) + list(incoming_tags)))
-                # Keep the payload blob and the filter column in sync: the
-                # union goes into both, so a later read sees the same tags.
-                payload["belongs_to_set"] = merged_tags
-                await self._execute(
-                    merge_query,
-                    {
-                        "id": str(data_point.id),
-                        "vector": vector,
+                tags = list(payload.get("belongs_to_set") or [])
+                previous = pending_table.get(str(data_point.id))
+                if previous is not None and previous["union_tags"]:
+                    prior_tags = [
+                        tag for tag in (previous["row"]["belongs_to_set"] or "").split("#") if tag
+                    ]
+                    tags = list(dict.fromkeys(prior_tags + tags))
+                # Keep the payload blob and the filter column in sync.
+                payload["belongs_to_set"] = tags
+                point_id = str(data_point.id)
+                pending_table[point_id] = {
+                    "row": {
+                        "id": point_id,
+                        "vector": [float(x) for x in vector],
                         "text": text,
                         "payload": json.dumps(payload, cls=JSONEncoder),
-                        "belongs_to_set": self._belongs_to_set_string(merged_tags),
+                        "belongs_to_set": self._belongs_to_set_string(tags),
                     },
-                )
+                    "union_tags": True,
+                }
+            await self._maybe_flush_pending()
 
     async def upsert_raw_vectors(
         self,
@@ -435,31 +581,40 @@ class NeuGVectorAdapter(VectorDBInterface):
             await self.create_collection(collection_name, payload_schema)
         table_name = self._collections[collection_name]
 
-        merge_query = self._MERGE_TEMPLATE.format(table=table_name)
+        # Validate everything up front so a bad point fails before any write.
+        validated: List[Tuple[str, list, dict]] = []
+        for point in points:
+            point_id = point.get("id")
+            vector = point.get("vector")
+            if point_id is None:
+                raise ValueError("Raw vector point is missing id")
+            if not isinstance(vector, list) or len(vector) != self.vector_size:
+                raise ValueError(
+                    f"Raw vector size {len(vector) if isinstance(vector, list) else 'n/a'} "
+                    f"does not match expected size {self.vector_size}"
+                )
+            payload = payload_schema.model_validate(point.get("payload")).model_dump()
+            text = str(payload.get("text") or "")
+            tags = [self._validate_tag(tag) for tag in (payload.get("belongs_to_set") or [])]
+            validated.append((str(point_id), vector, payload, text, tags))
+
         async with self.VECTOR_DB_LOCK:
-            for point in points:
-                point_id = point.get("id")
-                vector = point.get("vector")
-                if point_id is None:
-                    raise ValueError("Raw vector point is missing id")
-                if not isinstance(vector, list) or len(vector) != self.vector_size:
-                    raise ValueError(
-                        f"Raw vector size {len(vector) if isinstance(vector, list) else 'n/a'} "
-                        f"does not match expected size {self.vector_size}"
-                    )
-                payload = payload_schema.model_validate(point.get("payload")).model_dump()
-                text = str(payload.get("text") or "")
-                tags = [self._validate_tag(tag) for tag in (payload.get("belongs_to_set") or [])]
-                await self._execute(
-                    merge_query,
-                    {
-                        "id": str(point_id),
-                        "vector": vector,
+            # Buffer the rows for the deferred COPY flush; raw upserts
+            # replace stored tags, so no union on the MERGE fallback. Same id
+            # twice keeps the last occurrence.
+            pending_table = self._pending_rows.setdefault(table_name, {})
+            for point_id, vector, payload, text, tags in validated:
+                pending_table[point_id] = {
+                    "row": {
+                        "id": point_id,
+                        "vector": [float(x) for x in vector],
                         "text": text,
                         "payload": json.dumps(payload, cls=JSONEncoder),
                         "belongs_to_set": self._belongs_to_set_string(tags),
                     },
-                )
+                    "union_tags": False,
+                }
+            await self._maybe_flush_pending()
 
     async def retrieve(
         self, collection_name: str, data_point_ids: list[str], *, include_vector: bool = False
@@ -550,6 +705,10 @@ class NeuGVectorAdapter(VectorDBInterface):
             return []
         if limit is not None and limit <= 0:
             return []
+        # Deferred bulk index build (upstream workaround, safe on populated
+        # tables): ANN uses HNSW once present, exact scan until then.
+        async with self.VECTOR_DB_LOCK:
+            await self._ensure_search_indexes(table_name)
 
         if query_vector is None:
             # Match LanceDB semantics: a text-only search embeds the query and
@@ -627,6 +786,11 @@ class NeuGVectorAdapter(VectorDBInterface):
             return []
         if limit is not None and limit <= 0:
             return []
+        # bm25 requires the FTS index; bulk-build it lazily (upstream
+        # workaround). Without it this query fails, unlike ANN's exact-scan
+        # fallback, so a failed build surfaces as an empty result instead.
+        async with self.VECTOR_DB_LOCK:
+            await self._ensure_search_indexes(table_name)
 
         params: dict = {"q": self._sanitize_fts_query(query_text)}
         where = ""
@@ -765,5 +929,9 @@ class NeuGVectorAdapter(VectorDBInterface):
         """Release the shared connection manager reference (see the graph
         adapter's ``close()`` for the refcount semantics)."""
         if not self._closed:
+            try:
+                await self.flush_pending_writes()
+            except Exception as e:
+                logger.warning("Failed to flush buffered vector writes on close: %s", e)
             self._closed = True
             self.connection_manager.release()

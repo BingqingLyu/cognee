@@ -34,22 +34,22 @@ import json
 import re
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 from uuid import UUID
 
 from cognee.exceptions import CogneeValidationError
 from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInterface
 from cognee.infrastructure.databases.neug import get_neug_connection_manager
+from cognee.infrastructure.databases.neug.copy_batch import (
+    COPY_BUFFER_FLUSH_ROWS,
+    copy_jsonl_rows,
+)
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.retrieval.natural_language_retriever import GuidanceSchemaRow
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.shared.logging_utils import get_logger
 
 logger = get_logger("NeuGGraphAdapter")
-
-# Progress logging granularity for per-row write loops (NeuG has no UNWIND;
-# writes are executed as individual parameterized MERGE statements).
-_WRITE_CHUNK_SIZE = 256
 
 # ``type(x)`` does not exist in NeuG; ``label(x)`` returns the table name and
 # is the closest equivalent for LLM-generated Cypher.
@@ -160,6 +160,13 @@ class NeuGGraphAdapter(GraphDBInterface):
         self.connection_manager.acquire()
         self._closed = False
         self._schema_ensured = False
+        # Deferred COPY buffer: new rows collected across add_* calls, merged
+        # into one COPY statement per table at flush time (see
+        # ``flush_pending_writes``). Keyed by id / (from, to, label) so a
+        # repeat write inside the buffer keeps the last occurrence.
+        self._pending_nodes: Dict[str, dict] = {}
+        self._pending_edges: Dict[Tuple[str, str, str], dict] = {}
+        self._flushing = False
 
     # ------------------------------------------------------------------
     # Schema / execution plumbing
@@ -194,10 +201,26 @@ class NeuGGraphAdapter(GraphDBInterface):
         self._schema_ensured = True
 
     async def _execute(self, query: str, params: Optional[dict] = None) -> List[List[Any]]:
+        await self.flush_pending_writes()
+        return await self._execute_raw(query, params)
+
+    async def _execute_with_columns(
+        self, query: str, params: Optional[dict] = None
+    ) -> Tuple[List[List[Any]], List[str]]:
+        await self.flush_pending_writes()
+        return await self._execute_with_columns_raw(query, params)
+
+    async def _execute_raw(self, query: str, params: Optional[dict] = None) -> List[List[Any]]:
+        """Run a statement without flushing the COPY buffer first.
+
+        Only for use by ``flush_pending_writes`` and its helpers; everything
+        else goes through ``_execute`` so buffered writes are visible to
+        every read, delete and MERGE upsert.
+        """
         await self.ensure_schema()
         return await self.connection_manager.execute(query, params)
 
-    async def _execute_with_columns(
+    async def _execute_with_columns_raw(
         self, query: str, params: Optional[dict] = None
     ) -> Tuple[List[List[Any]], List[str]]:
         await self.ensure_schema()
@@ -421,9 +444,13 @@ class NeuGGraphAdapter(GraphDBInterface):
         )
         return bool(rows and rows[0][0])
 
-    def _node_merge_params(
-        self, node: Union[DataPoint, str], properties: Optional[dict] = None
-    ) -> dict:
+    def _node_record(self, node: Union[DataPoint, str], properties: Optional[dict] = None) -> dict:
+        """Build one full-column Node row keyed by its id.
+
+        The dict carries exactly the table's columns (``id/name/type/
+        created_at/updated_at/properties``) so it can feed both the COPY
+        bulk load and, with the id renamed to ``param_id``, the MERGE path.
+        """
         if isinstance(node, str):
             # Interface contract: a string node id with an explicit property
             # dict (``add_node("id", {...})``), used e.g. by
@@ -440,13 +467,33 @@ class NeuGGraphAdapter(GraphDBInterface):
             properties.pop(key, None)
         now = _now_iso()
         return {
-            "param_id": core["id"],
+            "id": core["id"],
             "name": core["name"],
             "type": core["type"],
-            "properties": json.dumps(properties, cls=JSONEncoder),
             "created_at": now,
             "updated_at": now,
+            "properties": json.dumps(properties, cls=JSONEncoder),
         }
+
+    @staticmethod
+    def _node_merge_params_from_record(record: dict) -> dict:
+        return {
+            "param_id": record["id"],
+            **{k: record[k] for k in ("name", "type", "properties", "created_at", "updated_at")},
+        }
+
+    async def _existing_node_ids(self, node_ids: List[str]) -> set:
+        """Return the subset of ``node_ids`` already present in the Node table.
+
+        Flush-only helper: runs through ``_execute_raw`` because it is only
+        called from ``flush_pending_writes`` after the buffer was drained.
+        """
+        if not node_ids:
+            return set()
+        params: dict = {}
+        where = self._ids_where_clause("n", node_ids, params)
+        rows = await self._execute_raw(f"MATCH (n:Node) WHERE {where} RETURN n.id", params)
+        return {str(row[0]) for row in rows}
 
     _NODE_MERGE_QUERY = """
         MERGE (n:Node {id: $param_id})
@@ -467,10 +514,97 @@ class NeuGGraphAdapter(GraphDBInterface):
         self, node: Union[DataPoint, str], properties: Optional[dict] = None
     ) -> None:
         try:
-            await self._execute(self._NODE_MERGE_QUERY, self._node_merge_params(node, properties))
+            record = self._node_record(node, properties)
+            self._pending_nodes[record["id"]] = record
+            await self._maybe_flush_pending()
         except Exception as e:
             logger.error(f"Failed to add node: {e}")
             raise
+
+    async def _copy_rows(
+        self,
+        table_name: str,
+        rows: List[dict],
+        merge_query: str,
+        merge_params_for: Callable[[dict], dict],
+        copy_options: str = "",
+    ) -> None:
+        """COPY-bulk-load ``rows``; on any failure fall back to per-row MERGE.
+
+        ``rows`` must contain only keys the table does not have yet: COPY
+        silently skips existing primary keys (first write wins), which would
+        drop updates, so the caller routes existing rows through MERGE
+        itself. Correctness never depends on the fast path.
+        """
+        if not rows:
+            return
+        try:
+            await copy_jsonl_rows(lambda q: self._execute_raw(q), table_name, rows, copy_options)
+        except Exception as e:
+            logger.warning(
+                "COPY bulk load into %s failed, falling back to MERGE: %s", table_name, e
+            )
+            for row in rows:
+                await self._execute_raw(merge_query, merge_params_for(row))
+
+    # ------------------------------------------------------------------
+    # Deferred COPY buffer
+    # ------------------------------------------------------------------
+
+    async def _maybe_flush_pending(self) -> None:
+        if len(self._pending_nodes) + len(self._pending_edges) >= COPY_BUFFER_FLUSH_ROWS:
+            await self.flush_pending_writes()
+
+    async def flush_pending_writes(self) -> None:
+        """Write all buffered rows to the database as one COPY per table.
+
+        Every statement issued through ``_execute`` flushes first, so reads,
+        deletes and MERGE upserts always see the buffered rows; this method
+        is the only place the buffer is drained. The new-vs-existing split
+        happens here at flush time (not when rows were buffered) so it
+        always reflects the current table state. Nodes are flushed before
+        edges because edge writes need their endpoint nodes in place.
+        """
+        if self._flushing or not (self._pending_nodes or self._pending_edges):
+            return
+        self._flushing = True
+        node_records, self._pending_nodes = self._pending_nodes, {}
+        edge_records, self._pending_edges = self._pending_edges, {}
+        try:
+            if node_records:
+                await self._flush_node_records(node_records)
+            if edge_records:
+                await self._flush_edge_records(edge_records)
+        finally:
+            self._flushing = False
+
+    async def _flush_node_records(self, records: Dict[str, dict]) -> None:
+        existing_ids = await self._existing_node_ids(list(records))
+        merge_records = [r for nid, r in records.items() if nid in existing_ids]
+        new_records = [r for nid, r in records.items() if nid not in existing_ids]
+        for record in merge_records:
+            await self._execute_raw(
+                self._NODE_MERGE_QUERY, self._node_merge_params_from_record(record)
+            )
+        await self._copy_rows(
+            "Node", new_records, self._NODE_MERGE_QUERY, self._node_merge_params_from_record
+        )
+
+    async def _flush_edge_records(self, records: Dict[Tuple[str, str, str], dict]) -> None:
+        existing = set(await self._existing_edge_keys_raw(list(records)))
+        merge_records = [r for key, r in records.items() if key in existing]
+        new_records = [r for key, r in records.items() if key not in existing]
+        for record in merge_records:
+            await self._execute_raw(
+                self._EDGE_MERGE_QUERY, self._edge_merge_params_from_record(record)
+            )
+        await self._copy_rows(
+            "EDGE",
+            new_records,
+            self._EDGE_MERGE_QUERY,
+            self._edge_merge_params_from_record,
+            "(from='Node', to='Node')",
+        )
 
     async def add_nodes(
         self,
@@ -483,11 +617,13 @@ class NeuGGraphAdapter(GraphDBInterface):
         if not nodes:
             return
         try:
-            total = len(nodes)
-            for index, node in enumerate(nodes):
-                await self._execute(self._NODE_MERGE_QUERY, self._node_merge_params(node))
-                if total > _WRITE_CHUNK_SIZE and (index + 1) % _WRITE_CHUNK_SIZE == 0:
-                    logger.info("Merged nodes %d/%d", index + 1, total)
+            # One record per id, last occurrence wins (sequential MERGE would
+            # do the same). Records join the pending COPY buffer; the flush
+            # merges many small batches into one COPY statement per table.
+            for node in nodes:
+                record = self._node_record(node)
+                self._pending_nodes[record["id"]] = record
+            await self._maybe_flush_pending()
         except Exception as e:
             logger.error(f"Failed to add nodes in batch: {e}")
             raise
@@ -543,17 +679,30 @@ class NeuGGraphAdapter(GraphDBInterface):
             r.properties = $properties
     """
 
-    def _edge_merge_params(
+    def _edge_record(
         self, from_node: str, to_node: str, relationship_name: str, properties: Dict[str, Any]
     ) -> dict:
         now = _now_iso()
+        # Key order matters for REL-table COPY: the first two JSON keys are
+        # the from/to endpoint keys.
         return {
-            "from_id": str(from_node),
-            "to_id": str(to_node),
+            "from": str(from_node),
+            "to": str(to_node),
             "relationship_name": relationship_name,
             "created_at": now,
             "updated_at": now,
             "properties": json.dumps(properties or {}, cls=JSONEncoder),
+        }
+
+    @staticmethod
+    def _edge_merge_params_from_record(record: dict) -> dict:
+        return {
+            "from_id": record["from"],
+            "to_id": record["to"],
+            "relationship_name": record["relationship_name"],
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+            "properties": record["properties"],
         }
 
     async def add_edge(
@@ -564,10 +713,9 @@ class NeuGGraphAdapter(GraphDBInterface):
         edge_properties: Dict[str, Any] = {},
     ) -> None:
         try:
-            await self._execute(
-                self._EDGE_MERGE_QUERY,
-                self._edge_merge_params(from_node, to_node, relationship_name, edge_properties),
-            )
+            record = self._edge_record(from_node, to_node, relationship_name, edge_properties)
+            self._pending_edges[(str(from_node), str(to_node), relationship_name)] = record
+            await self._maybe_flush_pending()
         except Exception as e:
             logger.error(f"Failed to add edge: {e}")
             raise
@@ -581,14 +729,15 @@ class NeuGGraphAdapter(GraphDBInterface):
         if not edges:
             return
         try:
-            total = len(edges)
-            for index, (from_node, to_node, relationship_name, properties) in enumerate(edges):
-                await self._execute(
-                    self._EDGE_MERGE_QUERY,
-                    self._edge_merge_params(from_node, to_node, relationship_name, properties),
-                )
-                if total > _WRITE_CHUNK_SIZE and (index + 1) % _WRITE_CHUNK_SIZE == 0:
-                    logger.info("Merged edges %d/%d", index + 1, total)
+            # One record per (from, to, relationship_name), last occurrence
+            # wins; the records join the pending COPY buffer. The flush does
+            # the existence split — REL tables have no primary key, so COPY
+            # would append duplicate edges and existing triples must go
+            # through MERGE instead.
+            for from_node, to_node, relationship_name, properties in edges:
+                record = self._edge_record(from_node, to_node, relationship_name, properties)
+                self._pending_edges[(str(from_node), str(to_node), relationship_name)] = record
+            await self._maybe_flush_pending()
         except Exception as e:
             logger.error(f"Failed to add edges in batch: {e}")
             raise
@@ -604,33 +753,42 @@ class NeuGGraphAdapter(GraphDBInterface):
         )
         return bool(rows and rows[0][0])
 
+    @staticmethod
+    def _edge_where_clause(edges: List[Tuple[str, str, str]], params: dict) -> str:
+        clauses = []
+        for i, (from_node, to_node, edge_label) in enumerate(edges):
+            params[f"f_{i}"] = str(from_node)
+            params[f"t_{i}"] = str(to_node)
+            params[f"r_{i}"] = str(edge_label)
+            clauses.append(f"(f.id = $f_{i} AND t.id = $t_{i} AND r.relationship_name = $r_{i})")
+        return " OR ".join(clauses)
+
+    _EDGE_EXISTS_QUERY = """
+        MATCH (f:Node)-[r:EDGE]->(t:Node)
+        WHERE {where}
+        RETURN f.id, t.id, r.relationship_name
+    """
+
     async def has_edges(self, edges: List[Tuple[str, str, str]]) -> List[Tuple[str, str, str]]:
         if not edges:
             return []
         try:
-            params: dict = {}
-            clauses = []
-            for i, (from_node, to_node, edge_label) in enumerate(edges):
-                params[f"f_{i}"] = str(from_node)
-                params[f"t_{i}"] = str(to_node)
-                params[f"r_{i}"] = str(edge_label)
-                clauses.append(
-                    f"(f.id = $f_{i} AND t.id = $t_{i} AND r.relationship_name = $r_{i})"
-                )
-            rows = await self._execute(
-                f"""
-                MATCH (f:Node)-[r:EDGE]->(t:Node)
-                WHERE {" OR ".join(clauses)}
-                RETURN f.id, t.id, r.relationship_name
-                """,
-                params,
-            )
-            return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
+            await self.flush_pending_writes()
+            return await self._existing_edge_keys_raw(edges)
         except Exception as e:
             # A failed existence check is not an empty one: callers treat []
             # as "none exist" and would re-write everything. Surface errors.
             logger.error(f"Failed to check edges in batch: {e}")
             raise
+
+    async def _existing_edge_keys_raw(
+        self, edges: List[Tuple[str, str, str]]
+    ) -> List[Tuple[str, str, str]]:
+        """Existing edge triples, without flushing (flush-only helper)."""
+        params: dict = {}
+        where = self._edge_where_clause(edges, params)
+        rows = await self._execute_raw(self._EDGE_EXISTS_QUERY.format(where=where), params)
+        return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
 
     @staticmethod
     def _is_missing_table_error(error: Exception) -> bool:
@@ -1214,10 +1372,14 @@ class NeuGGraphAdapter(GraphDBInterface):
         interpreter exit.
         """
         if not self._closed:
+            try:
+                await self.flush_pending_writes()
+            except Exception as e:
+                logger.warning("Failed to flush buffered graph writes on close: %s", e)
             self._closed = True
             self.connection_manager.release()
 
     async def checkpoint(self) -> None:
         # NeuG manages WAL checkpointing internally (checkpoint-on-close is
-        # the default); nothing to flush explicitly.
-        return None
+        # the default); the only adapter-level flush is the COPY buffer.
+        await self.flush_pending_writes()

@@ -410,15 +410,23 @@ async def test_vector_payload_survives_database_reopen(neug_db):
 
 @pytest.mark.asyncio
 async def test_collection_gets_hnsw_index(neug_db):
-    """Each collection gets a cosine HNSW index next to the FTS index. The
-    close-time corruption of the old 0.2.0 build (P30) is fixed in current
-    builds (see .neug_work/repro_upstream/repro4). SHOW INDEXES is not part
-    of the dialect, so index presence is asserted by attempting the same
-    CREATE INDEX the adapter would run."""
+    """Each collection gets a cosine HNSW index next to the FTS index, built
+    lazily on first search (the ingest path stays index-free to dodge the
+    upstream capacity bug; see ``_create_collection_table``). SHOW INDEXES is
+    not part of the dialect, so index presence is asserted by attempting the
+    same CREATE INDEX the adapter would run."""
     v = NeuGVectorAdapter(embedding_engine=_FakeEmbeddingEngine())
     try:
         await v.create_data_points("DataPoint_text", [_chunk("indexed text", ["set_a"])])
         table = await v.get_collection("DataPoint_text")
+        # The index is deferred: no search yet, so CREATE INDEX must succeed.
+        await v.connection_manager.execute(
+            f"CREATE INDEX {table}_probe_idx IF NOT EXISTS "
+            f"ON {table} USING HNSW (vector) WITH (metric = 'cosine')"
+        )
+        await v.connection_manager.execute(f"DROP INDEX {table}_probe_idx")
+        # First search bulk-builds the real indexes on the populated table.
+        await v.search("DataPoint_text", query_vector=_vec("indexed text"), limit=1)
         # re-creating the adapter's own index must say "already exists"
         with pytest.raises(RuntimeError, match="already exists"):
             await v.connection_manager.execute(
